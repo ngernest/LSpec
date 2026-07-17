@@ -95,7 +95,7 @@ instance (priority := 25) (p : Prop) [d : Decidable p] : Testable p :=
   | isTrue  h => .isTrue  h
 
 open SlimCheck in
-instance instTestableOfCheckable (p : Prop) (cfg : Configuration) [Checkable p] : Testable p :=
+abbrev instTestableOfCheckable (p : Prop) (cfg : Configuration) [Checkable p] : Testable p :=
   let ((res, numSamples), _) := ReaderT.run (Checkable.runSuite p cfg) (.up mkStdGen)
   match res with
   | .success (.inr h) => .isTrue h
