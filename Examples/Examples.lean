@@ -86,7 +86,7 @@ The output shows how many samples were tested.
 Use `check` for simple output or `check'` to see the property syntax.
 -/
 
-open LSpec SlimCheck
+open LSpec Plausible
 
 -- Nat has a SampleableExt instance for random generation
 example : SampleableExt Nat := by infer_instance
@@ -140,7 +140,8 @@ instance : Shrinkable Pairs where
 -- SampleableExt instance for random generation
 open SampleableExt
 
-def pairsGen : Gen Pairs := return ⟨← Gen.chooseAny Nat, ← Gen.chooseAny Nat⟩
+def pairsGen : Gen Pairs :=
+  return ⟨← SampleableExt.interpSample Nat, ← SampleableExt.interpSample Nat⟩
 
 instance : SampleableExt Pairs := mkSelfContained pairsGen
 
@@ -175,12 +176,12 @@ Weighted command generator:
 - noop: 10%, read: 50%, write: 30%, delete: 10%
 -/
 def commandGen : Gen Command :=
-  Gen.frequency #[
+  Gen.frequency (pure Command.noop) [
     (1, pure Command.noop),
     (5, pure Command.read),
     (3, pure Command.write),
     (1, pure Command.delete)
-  ] (pure Command.noop)
+  ]
 
 instance : Shrinkable Command where
   shrink := fun _ => []
@@ -198,11 +199,11 @@ Generate numbers with custom distributions.
 -/
 
 def biasedSmallGen : Gen Nat :=
-  Gen.frequency #[
-    (5, Gen.choose Nat 0 10),     -- 50%: small (0-10)
-    (3, Gen.choose Nat 11 100),   -- 30%: medium (11-100)
-    (2, Gen.choose Nat 101 1000)  -- 20%: larger (101-1000)
-  ] (pure 0)
+  Gen.frequency (pure 0) [
+    (5, Subtype.val <$> Gen.choose Nat 0 10 (by omega)),      -- 50%: small (0-10)
+    (3, Subtype.val <$> Gen.choose Nat 11 100 (by omega)),    -- 30%: medium (11-100)
+    (2, Subtype.val <$> Gen.choose Nat 101 1000 (by omega))   -- 20%: larger (101-1000)
+  ]
 
 structure BiasedNat where
   val : Nat

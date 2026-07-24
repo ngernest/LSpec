@@ -1,5 +1,4 @@
-module
-public import LSpec.SlimCheck.Checkable
+import Plausible
 
 /-!
 # The core `LSpec` framework
@@ -66,7 +65,6 @@ Use `check` and `checkIO` (without apostrophe) for simpler output.
 -/
 
 namespace LSpec
-public section
 /--
 The main typeclass of propositions that can be tested by `LSpec`.
 
@@ -94,14 +92,13 @@ instance (priority := 25) (p : Prop) [d : Decidable p] : Testable p :=
   | isFalse h => .isFalse h 0 0 "Evaluated to false"
   | isTrue  h => .isTrue  h
 
-open SlimCheck in
-abbrev instTestableOfCheckable (p : Prop) (cfg : Configuration) [Checkable p] : Testable p :=
-  let ((res, numSamples), _) := ReaderT.run (Checkable.runSuite p cfg) (.up mkStdGen)
-  match res with
-  | .success (.inr h) => .isTrue h
-  | .success (.inl _) => .isPassed numSamples
-  | .gaveUp n => .isFailure 0 cfg.numInst s!"Gave up {n} times"
-  | .failure h xs n => .isFalse h (numSamples + 1) cfg.numInst $ Checkable.formatFailure "Found problems!" xs n
+abbrev instTestableOfCheckable (p : Prop) (cfg : Plausible.Configuration) [Plausible.Testable p] : Testable p :=
+  match ReaderT.run (Plausible.runRandWith 0 (Plausible.Testable.runSuite p cfg)) ⟨0⟩ with
+  | .error _ => .isFailure 0 cfg.numInst "Generation failure"
+  | .ok (.success (.inr h)) => .isTrue h
+  | .ok (.success (.inl _)) => .isPassed cfg.numInst
+  | .ok (.gaveUp n) => .isFailure 0 cfg.numInst s!"Gave up {n} times"
+  | .ok (.failure h xs n) => .isFalse h 0 cfg.numInst $ Plausible.Testable.formatFailure "Found problems!" xs n
 
 /-- Formats the extra error message from `Testable` failures. -/
 def formatErrorMsg : Option String → String
@@ -172,7 +169,7 @@ def describe (descr : String) (groupTests : TestSeq) (next : TestSeq := .done) :
 def context (descr : String) (groupTests : TestSeq) (next : TestSeq := .done) : TestSeq :=
   group descr groupTests next
 
-open SlimCheck Decorations in
+open Plausible.Decorations in
 /--
 Property-based test evaluated at **compile time**.
 
@@ -193,13 +190,13 @@ across compilations.
 
 For runtime evaluation with configurable seeds, use `checkIO` instead.
 -/
-def check (descr : String) (p : Prop) (next : TestSeq := .done) (cfg : Configuration := {})
+def check (descr : String) (p : Prop) (next : TestSeq := .done) (cfg : Plausible.Configuration := {})
     (propString : Option String := none)
-    (p' : DecorationsOf p := by mk_decorations) [Checkable p'] : TestSeq :=
+    (p' : DecorationsOf p := by mk_decorations) [Plausible.Testable p'] : TestSeq :=
   haveI : Testable p' := instTestableOfCheckable p' cfg
   .individual descr p' propString inferInstance next
 
-open SlimCheck Decorations in
+open Plausible.Decorations in
 /--
 Property-based test evaluated at **runtime**.
 
@@ -231,15 +228,14 @@ def main : IO UInt32 := lspecIO (.ofList [("tests", [tests])]) []
 Note: `checkIO` tests are skipped when run via `#lspec` (which uses the pure runner).
 Use `lspecIO` or `lspecEachIO` to execute them.
 -/
-def checkIO (descr : String) (p : Prop) (next : TestSeq := .done) (cfg : Configuration := {})
+def checkIO (descr : String) (p : Prop) (next : TestSeq := .done) (cfg : Plausible.Configuration := {})
     (propString : Option String := none)
-    (p' : DecorationsOf p := by mk_decorations) [Checkable p'] : TestSeq :=
+    (p' : DecorationsOf p := by mk_decorations) [Plausible.Testable p'] : TestSeq :=
   let action : IO (Bool × Nat × Nat × Option String) := do
-    let (result, numSamples) ← Checkable.checkIO p' cfg
-    match result with
-    | .success _ => pure (true, numSamples, cfg.numInst, none)
+    match ← Plausible.Testable.checkIO p' cfg with
+    | .success _ => pure (true, cfg.numInst, cfg.numInst, none)
     | .gaveUp n => pure (false, 0, cfg.numInst, some s!"Gave up {n} times")
-    | .failure _ xs n => pure (false, numSamples, cfg.numInst, some $ Checkable.formatFailure "Found problems!" xs n)
+    | .failure _ xs n => pure (false, 0, cfg.numInst, some $ Plausible.Testable.formatFailure "Found problems!" xs n)
   .individualIO descr propString action next
 
 section SyntaxCapturingMacros
@@ -606,5 +602,4 @@ def lspecEachIO (l : List α) (f : α → IO TestSeq) : IO UInt32 := do
     | (false, msg) => IO.eprintln msg; pure false
   if success then return 0 else return 1
 
-end
 end LSpec
