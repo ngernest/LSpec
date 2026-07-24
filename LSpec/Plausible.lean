@@ -16,9 +16,6 @@ The new entry points are:
 
 - **`checkPlausible`/`checkPlausible'`**: compile-time property tests
 - **`checkPlausibleIO`/`checkPlausibleIO'`**: runtime property tests with configurable seeds
-
-Both funnel into the same `LSpec.Testable` result type and `TestSeq` machinery
-used by the rest of the framework, so test reporting and runners are shared.
 -/
 
 namespace LSpec
@@ -67,9 +64,9 @@ open Plausible.Decorations in
 /--
 Property-based test evaluated at compile time, using Plausible.
 
-This is the Plausible-based counterpart to `check`. Generates random test cases and checks the
-property during elaboration with a fixed random seed, making results deterministic across
-compilations.
+This is the Plausible-based counterpart to `check`, which uses SlimCheck.
+Generates random test cases and checks the property during elaboration with a fixed random seed,
+making results deterministic across compilations.
 
 - `descr`: Description shown in test output (can be empty if propString is provided)
 - `p`: The property to check (e.g., `∀ n m : Nat, n + m = m + n`)
@@ -150,6 +147,7 @@ scoped macro "checkPlausible'" descr:str prop:term : term => do
 open Lean in
 /--
 Macro for `checkPlausibleIO` that automatically captures the property syntax for display.
+This is the Plausible counterpart to LSpec's `checkIO'` macro that currently uses SlimCheck.
 
 This produces output like:
 ```
