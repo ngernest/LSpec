@@ -5,13 +5,14 @@ public meta import Plausible
 /-!
 # Plausible integration for `LSpec`
 
-This module provides an **additive** property-based testing backend for `LSpec`
+This module provides an alternative property-based testing backend for `LSpec`
 built on Lean's official [Plausible](https://github.com/leanprover-community/plausible)
-library, the maintained successor to SlimCheck.
+library.
 
-It lives alongside the existing SlimCheck-based `check`/`checkIO`
-(see `LSpec.LSpec`) rather than replacing them, so existing code that relies on
-SlimCheck continues to work unchanged. The new entry points are:
+For backwards-compatibility reasons, the functions in this module live alongside LSpec's
+SlimCheck-based `check`/`checkIO`functions, as opposed to replacing them.
+
+The new entry points are:
 
 - **`checkPlausible`/`checkPlausible'`**: compile-time property tests
 - **`checkPlausibleIO`/`checkPlausibleIO'`**: runtime property tests with configurable seeds
@@ -64,9 +65,9 @@ abbrev instTestableOfPlausible (p : Prop) (cfg : Plausible.Configuration) [Plaus
 
 open Plausible.Decorations in
 /--
-Property-based test evaluated at **compile time**, using Plausible.
+Property-based test evaluated at compile time, using Plausible.
 
-The Plausible-backed counterpart to `check`. Generates random test cases and checks the
+This is the Plausible-based counterpart to `check`. Generates random test cases and checks the
 property during elaboration with a fixed random seed, making results deterministic across
 compilations.
 
@@ -91,9 +92,9 @@ def checkPlausible (descr : String) (p : Prop) (next : TestSeq := .done)
 
 open Plausible.Decorations in
 /--
-Property-based test evaluated at **runtime**, using Plausible.
+Property-based test evaluated at runtime, using Plausible.
 
-The Plausible-backed counterpart to `checkIO`. Unlike `checkPlausible`, which runs during
+This is the Plausible-based analog to `checkIO`. Unlike `checkPlausible`, which runs during
 compilation, `checkPlausibleIO` defers test execution until the test suite is run, enabling
 configurable random seeds via `cfg.randomSeed` and fresh random values on each run.
 
