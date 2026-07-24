@@ -92,13 +92,42 @@ instance (priority := 25) (p : Prop) [d : Decidable p] : Testable p :=
   | isFalse h => .isFalse h 0 0 "Evaluated to false"
   | isTrue  h => .isTrue  h
 
+/-- Variant of `Plausible.Testable.runSuiteAux` that also threads the number of samples
+    that passed before the result. Plausible's own runners discard this count, but LSpec
+     needs it to report *which* sample failed. -/
+private def runPlausibleSuiteAux (p : Prop) [Plausible.Testable p] (cfg : Plausible.Configuration) :
+    Plausible.TestResult p → Nat → Plausible.Gen (Plausible.TestResult p × Nat)
+  | r, 0 => return (r, cfg.numInst)
+  | r, n + 1 => do
+    let size (_ : Nat) := (cfg.numInst - n - 1) * cfg.maxSize / cfg.numInst
+    let x ← Plausible.retry ((Plausible.Testable.runProp p cfg true).resize size) cfg.numRetries
+    match x with
+    | .success (PSum.inl ()) => runPlausibleSuiteAux p cfg x n
+    | .gaveUp g => runPlausibleSuiteAux p cfg (Plausible.giveUp g r) n
+    | _ => return (x, cfg.numInst - n - 1)
+
+/-- Variant of `Plausible.Testable.runSuite` that builds a Plausible generator for
+    the test result & the no. of trials that succeeded before a failure -/
+private def runPlausibleSuite (p : Prop) [Plausible.Testable p] (cfg : Plausible.Configuration := {}) :
+    Plausible.Gen (Plausible.TestResult p × Nat) :=
+  runPlausibleSuiteAux p cfg (.gaveUp 0) cfg.numInst
+
+/-- Variant of `Plausible.Testable.checkIO` that executes a property-based test for `p`,
+    returning (in the IO monad) the test result & the no. of trials that succeeded brefore a failure -/
+private def checkPlausibleIO (p : Prop) [Plausible.Testable p] (cfg : Plausible.Configuration := {}) :
+    IO (Plausible.TestResult p × Nat) :=
+  match cfg.randomSeed with
+  | none => Plausible.Gen.run (runPlausibleSuite p cfg) 0
+  | some seed => Plausible.runRandWith seed (runPlausibleSuite p cfg)
+
 abbrev instTestableOfCheckable (p : Prop) (cfg : Plausible.Configuration) [Plausible.Testable p] : Testable p :=
-  match ReaderT.run (Plausible.runRandWith 0 (Plausible.Testable.runSuite p cfg)) ⟨0⟩ with
+  match ReaderT.run (Plausible.runRandWith 0 (runPlausibleSuite p cfg)) ⟨0⟩ with
   | .error _ => .isFailure 0 cfg.numInst "Generation failure"
-  | .ok (.success (.inr h)) => .isTrue h
-  | .ok (.success (.inl _)) => .isPassed cfg.numInst
-  | .ok (.gaveUp n) => .isFailure 0 cfg.numInst s!"Gave up {n} times"
-  | .ok (.failure h xs n) => .isFalse h 0 cfg.numInst $ Plausible.Testable.formatFailure "Found problems!" xs n
+  | .ok (.success (.inr h), _) => .isTrue h
+  | .ok (.success (.inl _), _) => .isPassed cfg.numInst
+  | .ok (.gaveUp n, _) => .isFailure 0 cfg.numInst s!"Gave up {n} times"
+  | .ok (.failure h xs n, numSamples) =>
+    .isFalse h (numSamples + 1) cfg.numInst $ Plausible.Testable.formatFailure "Found problems!" xs n
 
 /-- Formats the extra error message from `Testable` failures. -/
 def formatErrorMsg : Option String → String
@@ -232,10 +261,11 @@ def checkIO (descr : String) (p : Prop) (next : TestSeq := .done) (cfg : Plausib
     (propString : Option String := none)
     (p' : DecorationsOf p := by mk_decorations) [Plausible.Testable p'] : TestSeq :=
   let action : IO (Bool × Nat × Nat × Option String) := do
-    match ← Plausible.Testable.checkIO p' cfg with
-    | .success _ => pure (true, cfg.numInst, cfg.numInst, none)
-    | .gaveUp n => pure (false, 0, cfg.numInst, some s!"Gave up {n} times")
-    | .failure _ xs n => pure (false, 0, cfg.numInst, some $ Plausible.Testable.formatFailure "Found problems!" xs n)
+    match ← checkPlausibleIO p' cfg with
+    | (.success _, _) => pure (true, cfg.numInst, cfg.numInst, none)
+    | (.gaveUp n, _) => pure (false, 0, cfg.numInst, some s!"Gave up {n} times")
+    | (.failure _ xs n, numSamples) =>
+      pure (false, numSamples, cfg.numInst, some $ Plausible.Testable.formatFailure "Found problems!" xs n)
   .individualIO descr propString action next
 
 section SyntaxCapturingMacros
