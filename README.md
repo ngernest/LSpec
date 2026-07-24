@@ -1,6 +1,7 @@
 # LSpec
 
-A testing framework for Lean 4, inspired by Haskell's [Hspec](https://hspec.github.io/) package.
+This repo contains a fork of the `LSpec` Lean testing framework, adapted to work with 
+Lean's [Plausible](https://github.com/leanprover-community/plausible) property-based testing library. 
 
 ## Usage
 
@@ -89,27 +90,26 @@ def main := lspecIO $ .ofList [
 Once such `main` function is defined, its respective executable can be tagged as the `@[test_driver]` in the lakefile.
 For further information, inspect the docstring of `lspecIO`.
 
-## Integration with `SlimCheck`
+## Integration with `Plausible`
 
-There are 3 main typeclasses associated with any  `SlimCheck` test:
+There are 3 main typeclasses associated with any `Plausible` property-based test:
 
 * `Shrinkable` : The typeclass that takes a type `a : α` and returns a `List α` of elements which
   should be thought of as being "smaller" than `a` (in some sense dependent on the type `α` being 
   considered).
-* `SampleableExt` : The typeclass of a . 
-  This is roughly equivalent to `QuickCheck`'s `Arbitrary` typeclass. 
-* `Checkable` : The property to be checked by `SlimCheck` must have a `Checkable` instance.
+* `SampleableExt` : The typeclass of random generators for values of type ` α`. This is roughly equivalent to the Arbitrary` typeclass in Haskell QuickCheck.
+* `Plausible.Testable` : The property to be checked by `Plausible` must have a `Plausible.Testable` instance.
 
-In order to use `SlimCheck` tests for custom data types, the user will need to implement 
+In order to use `Plausible` tests for custom data types, the user will need to implement 
 instances of the typeclasses `Shrinkable` and `SampleableExt` for the custom types appearing
 in the properties being tested.
 
-The module [LSpec.SlimCheck.Checkable](LSpec/SlimCheck/Checkable.lean) contains may of 
-the useful definitions and instances that can be used to derive a Checkable instance 
+The [`Plausible`](https://github.com/leanprover-community/plausible) library contains many of 
+the useful definitions and instances that can be used to derive a `Plausible.Testable` instance 
 for a wide variety of properties given just the instances above. If all else fails, the user can 
-also define the Checkable instance by hand. 
+also define the `Plausible.Testable` instance by hand. 
 
-Once this is done a `Slimcheck` test is evaluated in a similar way to 
+Once this is done, a `Plausible` test is evaluated in a similar way to 
 `LSpec` tests: 
 
 ```lean
