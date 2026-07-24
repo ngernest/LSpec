@@ -92,9 +92,8 @@ instance (priority := 25) (p : Prop) [d : Decidable p] : Testable p :=
   | isFalse h => .isFalse h 0 0 "Evaluated to false"
   | isTrue  h => .isTrue  h
 
-/-- Variant of `Plausible.Testable.runSuiteAux` that also threads the number of samples
-    that passed before the result. Plausible's own runners discard this count, but LSpec
-     needs it to report *which* sample failed. -/
+/-- Variant of `Plausible.Testable.runSuiteAux`: tries `n` times to find a counter-example to `p`,
+    and reports the no. of trials that succeeded before a counterexample was found -/
 private def runPlausibleSuiteAux (p : Prop) [Plausible.Testable p] (cfg : Plausible.Configuration) :
     Plausible.TestResult p → Nat → Plausible.Gen (Plausible.TestResult p × Nat)
   | r, 0 => return (r, cfg.numInst)
@@ -106,14 +105,14 @@ private def runPlausibleSuiteAux (p : Prop) [Plausible.Testable p] (cfg : Plausi
     | .gaveUp g => runPlausibleSuiteAux p cfg (Plausible.giveUp g r) n
     | _ => return (x, cfg.numInst - n - 1)
 
-/-- Variant of `Plausible.Testable.runSuite` that builds a Plausible generator for
-    the test result & the no. of trials that succeeded before a failure -/
+/-- Variant of `Plausible.Testable.runSuite` (tries to find a counter-example to `p`),
+    but also tracks the no. of trials that succeeded before a counterexample was found -/
 private def runPlausibleSuite (p : Prop) [Plausible.Testable p] (cfg : Plausible.Configuration := {}) :
     Plausible.Gen (Plausible.TestResult p × Nat) :=
   runPlausibleSuiteAux p cfg (.gaveUp 0) cfg.numInst
 
-/-- Variant of `Plausible.Testable.checkIO` that executes a property-based test for `p`,
-    returning (in the IO monad) the test result & the no. of trials that succeeded brefore a failure -/
+/-- Variant of `Plausible.Testable.checkIO` (run a test suite for `p` in `IO` using the global RNG in `stdGenRef`),
+     but also tracks the no. of traisl that succeeded -/
 private def checkPlausibleIO (p : Prop) [Plausible.Testable p] (cfg : Plausible.Configuration := {}) :
     IO (Plausible.TestResult p × Nat) :=
   match cfg.randomSeed with
