@@ -3,6 +3,11 @@ version = "2.0.0"
 defaultTargets = ["LSpec"]
 testDriver = "tests"
 
+[[require]]
+name = "plausible"
+git = "https://github.com/leanprover-community/plausible"
+rev = "83e90935a17ca19ebe4b7893c7f7066e266f50d3"
+
 [[lean_lib]]
 name = "LSpec"
 
