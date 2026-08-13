@@ -340,6 +340,21 @@ def parallelTests : TestSeq :=
       else pure (false, 0, 0,
         some s!"got {vals.length} counterexamples, {vals.eraseDups.length} distinct")
     ) .done ++
+    -- This is the whole reason `seedFor` mixes rather than returning `baseSeed + idx`. With
+    -- unmixed seeds the k-th sample across tests is an arithmetic progression, and at k = 0 that
+    -- pins the parity: all 200 first samples come out odd. Assert the parity is actually split.
+    .individualIO "seedFor removes the low-position bias of baseSeed + idx" none (do
+      let firstSample (seed : Nat) : Nat := (randNat (mkStdGen seed) 0 999).1
+      let evens (seedOf : Nat → Nat) : Nat :=
+        (((List.range 200).map (firstSample ∘ seedOf)).filter (· % 2 == 0)).length
+      let mixed := evens (LSpec.seedFor 0)
+      let unmixed := evens id
+      -- The mixed seeds must be roughly balanced; the unmixed ones demonstrably are not.
+      if 60 ≤ mixed && mixed ≤ 140 && (unmixed == 0 || unmixed == 200) then
+        pure (true, 0, 0, none)
+      else pure (false, 0, 0,
+        some s!"seedFor gave {mixed}/200 even (want 60..140); baseSeed+idx gave {unmixed}/200")
+    ) .done ++
     .individualIO "seedFor is injective" none (do
       let seeds := (List.range 2000).map (LSpec.seedFor 0)
       if seeds.eraseDups.length == seeds.length then pure (true, 0, 0, none)

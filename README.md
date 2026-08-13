@@ -262,10 +262,16 @@ get the exact same generator". Sharing it across threads would both race on the 
 silently collapse coverage.
 
 So deferred property tests no longer touch it. Each takes a seed derived from its **position**
-in the sequence, `seedFor baseSeed i`, spread with the SplitMix64 finalizer so that neighbouring
-tests get uncorrelated sample streams. Samples then depend only on `baseSeed` and position, never
-on scheduling order, which is what makes the parallel and sequential runners agree. A failing
-property reports the seed that produced it:
+in the sequence, `seedFor baseSeed i`. Samples then depend only on `baseSeed` and position, never
+on scheduling order, which is what makes the parallel and sequential runners agree.
+
+`seedFor` mixes rather than just returning `baseSeed + i`, because `mkStdGen` only slices its
+input, which would leave the `k`-th sample across tests in an arithmetic progression. That costs
+coverage at the low positions: over 200 tests drawing from `0..999`, unmixed seeds give a first
+sample that is odd every single time. See `LSpec.seedFor` for the details and the limits of the
+effect.
+
+A failing property reports the seed that produced it:
 
 ```
 × ∃⁴⁵/₁₀₀: "bogus" (∀ n : Nat, n < 40)
