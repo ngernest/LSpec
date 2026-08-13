@@ -1,6 +1,5 @@
 module
 public import LSpec.LSpec
-public import Std.Sync.Mutex
 
 /-!
 # Parallel test execution for `LSpec`
@@ -39,8 +38,13 @@ the sequential one and a failing test can be replayed with the reported `randomS
 - `maxConcurrent := none` (default): each test becomes a regular-priority `Task`. Lean's task
   scheduler allocates no more workers than there are cores, so this is the analogue of `tasty`'s
   default `-j <numCores>`. Override with the `LEAN_NUM_THREADS` environment variable.
-- `maxConcurrent := some n`: a work-stealing pool of exactly `n` dedicated threads pulls tests
-  off a shared queue, the analogue of passing `-j n`.
+- `maxConcurrent := some n`: the tests are split into `n` chains of tasks linked by
+  `IO.bindTask`, the analogue of passing `-j n`.
+
+Both levels are built only from the task combinators in `Init.System.IO` — `IO.asTask` to launch
+a test and `IO.bindTask` to make one test wait for another. There is no lock, no shared counter
+and no promise anywhere: every ordering constraint is expressed as a dependency between tasks,
+which is what the reference manual recommends over blocking on results.
 
 ## Caveats
 
@@ -59,8 +63,8 @@ public section
 structure ParallelConfig where
   /--
   Maximum number of tests to run at once. `none` defers to Lean's task scheduler, which uses
-  one worker per core (configurable via `LEAN_NUM_THREADS`). `some n` uses a pool of exactly
-  `n` dedicated threads; `some 0` is treated as `some 1`.
+  one worker per core (configurable via `LEAN_NUM_THREADS`). `some n` splits the tests into `n`
+  chains of tasks, so at most `n` are ever in flight; `some 0` is treated as `some 1`.
   -/
   maxConcurrent : Option Nat := none
   /--
@@ -82,15 +86,6 @@ private def awaitTask (task : Task (Except IO.Error IOTestOutcome)) : IO IOTestO
   | .ok outcome => pure outcome
   | .error e => throw e
 
-/-- Waits on a promise filled in by a worker thread. A `none` result means the promise was
-    dropped without being resolved, which can only happen if the worker pool died. -/
-private def awaitPromise (promise : IO.Promise (Except IO.Error IOTestOutcome)) :
-    IO IOTestOutcome := do
-  match ← IO.wait promise.result? with
-  | some (.ok outcome) => pure outcome
-  | some (.error e) => throw e
-  | none => throw <| .userError "LSpec: test was never scheduled (worker pool terminated early)"
-
 /-- Launches every deferred test as its own regular-priority `Task`, letting Lean's scheduler
     bound the concurrency to the number of cores. -/
 private def spawnUnbounded : TestSeq → BaseIO TestSeq
@@ -106,46 +101,71 @@ private def spawnUnbounded : TestSeq → BaseIO TestSeq
     let ts' ← spawnUnbounded ts
     pure <| .group d ts' (← spawnUnbounded n)
 
-/-- One unit of queued work: the test's action and the promise its result is published to. -/
-private structure Work where
-  action : IO IOTestOutcome
-  promise : IO.Promise (Except IO.Error IOTestOutcome)
+/--
+The tasks launched so far, in traversal order. Threading this through successive `TestSeq`s is
+what lets `lspecIOParallel` bound concurrency across *all* suites rather than per suite.
+-/
+private abbrev SpawnState := Array (Task (Except IO.Error IOTestOutcome))
 
-/-- Replaces each deferred test with a wait on a fresh promise, collecting the corresponding
-    work items in traversal order. -/
-private def enqueue (queue : IO.Ref (Array Work)) : TestSeq → BaseIO TestSeq
-  | .done => pure .done
-  | .individual d p ps i n => (.individual d p ps i) <$> enqueue queue n
-  | .individualIO d ps action n => do
-    let promise ← IO.Promise.new
-    queue.modify (·.push { action, promise })
-    pure <| .individualIO d ps (awaitPromise promise) (← enqueue queue n)
-  | .individualSeededIO d ps action n =>
-    (.individualSeededIO d ps action) <$> enqueue queue n
-  | .group d ts n => do
-    let ts' ← enqueue queue ts
-    pure <| .group d ts' (← enqueue queue n)
+/--
+Launches every deferred test onto one of `n` concurrent *chains* of tasks.
 
-/-- A single pool worker: repeatedly claims the next unclaimed test and resolves its promise.
-    Claiming is guarded by a mutex, which gives work-stealing rather than a static split, so a
-    few slow properties cannot leave the other threads idle. -/
-private partial def worker (queue : Array Work) (cursor : Std.Mutex Nat) : BaseIO Unit := do
-  let idx ← cursor.atomically (do let idx ← get; set (idx + 1); pure idx)
-  if let some work := queue[idx]? then
-    -- `toBaseIO` keeps a throwing test from killing the worker and stranding later promises.
-    work.promise.resolve (← work.action.toBaseIO)
-    worker queue cursor
+The `i`-th deferred test is chained onto the task of test `i - n` with `IO.bindTask`, so it only
+starts once that task has finished. This partitions the tests into `n` chains that each run
+their own tests one after another, which bounds the number of tests in flight at `n` without any
+explicit synchronisation: the dependency is carried by the tasks themselves. The reference manual
+recommends exactly this, preferring `Task.bind`/`IO.bindTask` over blocking on `Task.get` to set
+up task dependencies, since blocking has to grow the thread pool to avoid starvation.
 
-/-- Launches every deferred test onto a pool of exactly `n` dedicated threads. -/
-private def spawnBounded (tSeq : TestSeq) (n : Nat) : BaseIO TestSeq := do
-  let queueRef ← IO.mkRef #[]
-  let rewritten ← enqueue queueRef tSeq
-  let queue ← queueRef.get
-  let cursor ← Std.Mutex.new 0
-  -- Never spawn more threads than there is work, and never spawn zero threads for real work.
-  for _ in [0 : min (max n 1) queue.size] do
-    let _ ← IO.asTask (worker queue cursor) Task.Priority.dedicated
-  pure rewritten
+Each task still carries its own test's result, so the renderer waits on tests individually and
+prints them in sequence order.
+
+The chains are a static round-robin split rather than a work-stealing queue, so one very slow
+property delays the rest of its chain. That is the trade for needing no shared mutable state;
+with more tests than chains the imbalance averages out. Use the default `maxConcurrent := none`
+to let Lean's scheduler balance the work itself.
+-/
+private def spawnChained (n : Nat) : TestSeq → SpawnState → BaseIO (TestSeq × SpawnState) :=
+  go
+where
+  /-- `started` holds the task of every deferred test launched so far, in traversal order, so
+      that `started[i - n]` is the tail of the chain the `i`-th test belongs to. -/
+  go : TestSeq → SpawnState → BaseIO (TestSeq × SpawnState)
+    | .done, started => pure (.done, started)
+    | .individual d p ps i next, started => do
+      let (next', started) ← go next started
+      pure (.individual d p ps i next', started)
+    | .individualIO d ps action next, started => do
+      let idx := started.size
+      -- The first `n` tests open the chains; later tests extend one. Note `idx - n` truncates
+      -- to `0` on `Nat`, so the `idx < n` case has to come first.
+      let task ←
+        if idx < n then
+          IO.asTask action Task.Priority.dedicated
+        else
+          match started[idx - n]? with
+          | some tail =>
+            -- The previous result is ignored, so a throwing test does not strand its chain.
+            IO.bindTask tail fun _ => IO.asTask action Task.Priority.dedicated
+          | none => IO.asTask action Task.Priority.dedicated
+      let (next', started) ← go next (started.push task)
+      pure (.individualIO d ps (awaitTask task) next', started)
+    | .individualSeededIO d ps action next, started => do
+      let (next', started) ← go next started
+      pure (.individualSeededIO d ps action next', started)
+    | .group d ts next, started => do
+      let (ts', started) ← go ts started
+      let (next', started) ← go next started
+      pure (.group d ts' next', started)
+
+/-- Assigns seeds, then spawns, continuing the chains recorded in `started` so that a caller
+    spawning several `TestSeq`s in turn keeps one shared concurrency bound across all of them. -/
+private def spawnIOFrom (cfg : ParallelConfig) (tSeq : TestSeq) (started : SpawnState) :
+    BaseIO (TestSeq × SpawnState) := do
+  let seeded := tSeq.assignSeeds cfg.baseSeed
+  match cfg.maxConcurrent with
+  | none => (·, started) <$> spawnUnbounded seeded
+  | some n => spawnChained (max n 1) seeded started
 
 /--
 Starts every deferred test in `tSeq` running concurrently and returns a `TestSeq` of the same
@@ -156,11 +176,8 @@ This is the scheduling half of the runner; pass the result to `TestSeq.runIOAux`
 caller can spawn several independent `TestSeq`s and only then start printing, which is how
 `lspecIOParallel` overlaps work across suites.
 -/
-def TestSeq.spawnIO (tSeq : TestSeq) (cfg : ParallelConfig := {}) : BaseIO TestSeq := do
-  let seeded := tSeq.assignSeeds cfg.baseSeed
-  match cfg.maxConcurrent with
-  | none => spawnUnbounded seeded
-  | some n => spawnBounded seeded n
+def TestSeq.spawnIO (tSeq : TestSeq) (cfg : ParallelConfig := {}) : BaseIO TestSeq :=
+  Prod.fst <$> spawnIOFrom cfg tSeq #[]
 
 end Spawning
 
@@ -220,9 +237,17 @@ def lspecIOParallel (map : HashMap String (List TestSeq)) (args : List String)
             acc := (key, tSeqs) :: acc
       pure acc
 
-  -- Schedule everything first so that suites overlap, then render in order.
-  let spawned ← entries.mapM fun (key, tSeqs) =>
-    (key, ·) <$> tSeqs.mapM (·.spawnIO cfg)
+  -- Schedule everything first so that suites overlap, then render in order. The spawn state is
+  -- threaded across suites so `maxConcurrent` bounds the whole run, not each suite separately.
+  let mut started : SpawnState := #[]
+  let mut spawned : Array (String × List TestSeq) := #[]
+  for (key, tSeqs) in entries do
+    let mut spawnedSeqs : Array TestSeq := #[]
+    for tSeq in tSeqs do
+      let (tSeq', started') ← spawnIOFrom cfg tSeq started
+      started := started'
+      spawnedSeqs := spawnedSeqs.push tSeq'
+    spawned := spawned.push (key, spawnedSeqs.toList)
 
   let mut testsWithErrors : Array (String × Array String) := #[]
   for (key, tSeqs) in spawned do

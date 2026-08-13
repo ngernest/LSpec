@@ -230,12 +230,25 @@ samples, same counterexamples, same exit code — only faster.
 -- One worker per core (the default); override globally with LEAN_NUM_THREADS.
 props.runIOParallel
 
--- `tasty`'s `-j 4`: a pool of exactly four dedicated threads.
+-- `tasty`'s `-j 4`: at most four tests in flight.
 props.runIOParallel { maxConcurrent := some 4 }
 
 -- Replay an entire run, seeds included.
 props.runIOParallel { baseSeed := 42 }
 ```
+
+Both levels are built only from the task combinators in the standard library: `IO.asTask` to
+launch a test, and `IO.bindTask` to make one test wait for another. `maxConcurrent := some n`
+links the tests into `n` chains, so test `i` starts only once test `i - n` has finished. That
+caps the tests in flight at `n` with no lock, no shared counter and no promise — the ordering
+constraint is carried by the tasks themselves, which is what the
+[reference manual](https://lean-lang.org/doc/reference/latest/IO/Tasks-and-Threads/) recommends
+over blocking on results. `lspecIOParallel` threads the chains across suites, so `n` bounds the
+whole run rather than each suite.
+
+The chains are a static round-robin split, not a work-stealing queue, so one very slow property
+delays the rest of its chain. Leave `maxConcurrent := none` to let Lean's scheduler balance the
+work itself.
 
 ### Seeding and reproducibility
 

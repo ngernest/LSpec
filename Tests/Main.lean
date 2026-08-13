@@ -182,6 +182,18 @@ def sleepers (n ms : Nat) : TestSeq :=
     .individualIO s!"sleep {k}" none
       (do IO.sleep (UInt32.ofNat ms); pure (true, 0, 0, none)) (sleepers k ms)
 
+-- `n` deferred tests that record the high-water mark of how many ran at the same time.
+def probes (live peak : IO.Ref Nat) (n : Nat) : TestSeq :=
+  match n with
+  | 0 => .done
+  | k + 1 =>
+    .individualIO s!"probe {k}" none (do
+      let inFlight ← live.modifyGet fun l => (l + 1, l + 1)
+      peak.modify (max · inFlight)
+      IO.sleep 60
+      live.modify (· - 1)
+      pure (true, 0, 0, none)) (probes live peak k)
+
 def parallelTests : TestSeq :=
   group "Parallel runner" (
     .individualIO "runIOParallel output matches runIO byte-for-byte" none (do
@@ -190,7 +202,7 @@ def parallelTests : TestSeq :=
       if seqPass == parPass && seqOut == parOut then pure (true, 0, 0, none)
       else pure (false, 0, 0, some s!"sequential:\n{seqOut}\nparallel:\n{parOut}")
     ) .done ++
-    .individualIO "bounded pool output matches runIO" none (do
+    .individualIO "chained output matches runIO" none (do
       let (_, seqOut) ← mixedSeq.runIO
       let (_, out1) ← mixedSeq.runIOParallel { maxConcurrent := some 1 }
       let (_, out3) ← mixedSeq.runIOParallel { maxConcurrent := some 3 }
@@ -218,6 +230,40 @@ def parallelTests : TestSeq :=
       -- Sequentially this is ~1200 ms; overlapped it should be near 200 ms.
       if elapsed < 900 then pure (true, 0, 0, none)
       else pure (false, 0, 0, some s!"6x200ms overlapped took {elapsed} ms (expected < 900)")
+    ) .done ++
+    -- The chains built by `IO.bindTask` must bound the tests in flight exactly, not just
+    -- roughly: with `maxConcurrent := some n` the peak must be `min n (number of tests)`.
+    .individualIO "maxConcurrent bounds the tests in flight exactly" none (do
+      let mut bad := #[]
+      for n in [1, 2, 3, 8, 20] do
+        let live ← IO.mkRef 0
+        let peak ← IO.mkRef 0
+        let _ ← (probes live peak 8).runIOParallel { maxConcurrent := some n }
+        let observed ← peak.get
+        let expected := min n 8
+        unless observed == expected do
+          bad := bad.push s!"j={n}: peak={observed}, expected {expected}"
+        unless (← live.get) == 0 do
+          bad := bad.push s!"j={n}: {← live.get} tests still in flight"
+      if bad.isEmpty then pure (true, 0, 0, none)
+      else pure (false, 0, 0, some s!"{bad.toList}")
+    ) .done ++
+    -- Each test is chained onto an earlier one with the earlier result ignored, so a test that
+    -- throws must not strand the rest of its chain.
+    .individualIO "a throwing test does not strand its chain" none (do
+      let ran ← IO.mkRef 0
+      let mk (i : Nat) (next : TestSeq) : TestSeq :=
+        .individualIO s!"t{i}" none (do
+          ran.modify (· + 1)
+          if i == 0 then throw (.userError "boom")
+          pure (true, 0, 0, none)) next
+      -- Every test sits in one chain behind the throwing one.
+      let spawned ← (mk 0 (mk 1 (mk 2 (mk 3 .done)))).spawnIO { maxConcurrent := some 1 }
+      -- The renderer aborts at test 0, so wait for the chain to drain before counting.
+      let _ ← (spawned.runIOAux : IO _).toBaseIO
+      IO.sleep 300
+      if (← ran.get) == 4 then pure (true, 0, 0, none)
+      else pure (false, 0, 0, some s!"only {← ran.get} of 4 chained tests ran")
     ) .done ++
     .individualIO "same baseSeed replays, different baseSeed does not" none (do
       let (_, a) ← mixedSeq.runIOParallel { baseSeed := 7 }
@@ -263,7 +309,7 @@ def parallelTests : TestSeq :=
         if (toString e).containsSub "kaboom" then pure (true, 0, 0, none)
         else pure (false, 0, 0, some s!"unexpected error: {e}")
     ) .done ++
-    .individualIO "degenerate sequences and pool sizes" none (do
+    .individualIO "degenerate sequences and chain counts" none (do
       let (d, dOut) ← TestSeq.done.runIOParallel
       let (u, _) ← (test "pure" (1 = 1)).runIOParallel
       -- `maxConcurrent := some 0` must still make progress rather than deadlock.
@@ -310,6 +356,18 @@ def lspecIOParallelTests : TestSeq :=
       let rc ← lspecIOParallel (.ofList [("suite", [test "t" (1 = 2)])]) ["nonexistent"]
       if rc == 0 then pure (true, 0, 0, none)
       else pure (false, 0, 0, some s!"expected rc=0 with no matches, got rc={rc}")
+    ) .done ++
+    -- `maxConcurrent` must bound the whole run. Spawn state is threaded across suites, so five
+    -- suites with `some 2` run two tests at a time in total, not two per suite.
+    .individualIO "maxConcurrent bounds concurrency across suites" none (do
+      let live ← IO.mkRef 0
+      let peak ← IO.mkRef 0
+      let map : Std.HashMap String (List TestSeq) := .ofList
+        ((List.range 5).map fun i => (s!"suite{i}", [probes live peak 3]))
+      let rc ← quietly (lspecIOParallel map [] { maxConcurrent := some 2 })
+      let observed ← peak.get
+      if rc == 0 && observed == 2 then pure (true, 0, 0, none)
+      else pure (false, 0, 0, some s!"rc={rc}, peak={observed} across 5 suites (expected 2)")
     ) .done ++
     .individualIO "suites overlap in wall-clock time" none (quietly do
       let slow : TestSeq :=
