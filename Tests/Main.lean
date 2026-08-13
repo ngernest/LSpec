@@ -156,6 +156,174 @@ def plausiblePropertyTests : TestSeq :=
       (assertRunIO (checkPlausibleIO "bad" (∀ n : Nat, n = n + 1)) false) .done
   )
 
+/-! ## Parallel runner
+
+`runIOParallel` must be observationally equivalent to `runIO`: same ordering, same formatting,
+same samples, same verdict — only faster. These tests pin that down, plus the seeding
+guarantees that make it true.
+-/
+
+-- A mixed sequence: passing and failing properties, plain IO tests, and a nested group.
+def mixedSeq : TestSeq :=
+  (checkPlausibleIO' "add_comm" (∀ n m : Nat, n + m = m + n)) ++
+  (checkIO' "mul_comm" (∀ n m : Nat, n * m = m * n)) ++
+  test "unit" (1 = 1) ++
+  (checkPlausibleIO' "bogus" (∀ n : Nat, n < 40)) ++
+  group "nested" (
+    (checkIO' "sub_self" (∀ n : Nat, n - n = 0)) ++
+    (checkPlausibleIO' "bogus2" (∀ l : List Nat, l.length < 3))
+  )
+
+-- `n` deferred tests that each sleep `ms` milliseconds.
+def sleepers (n ms : Nat) : TestSeq :=
+  match n with
+  | 0 => .done
+  | k + 1 =>
+    .individualIO s!"sleep {k}" none
+      (do IO.sleep (UInt32.ofNat ms); pure (true, 0, 0, none)) (sleepers k ms)
+
+def parallelTests : TestSeq :=
+  group "Parallel runner" (
+    .individualIO "runIOParallel output matches runIO byte-for-byte" none (do
+      let (seqPass, seqOut) ← mixedSeq.runIO
+      let (parPass, parOut) ← mixedSeq.runIOParallel
+      if seqPass == parPass && seqOut == parOut then pure (true, 0, 0, none)
+      else pure (false, 0, 0, some s!"sequential:\n{seqOut}\nparallel:\n{parOut}")
+    ) .done ++
+    .individualIO "bounded pool output matches runIO" none (do
+      let (_, seqOut) ← mixedSeq.runIO
+      let (_, out1) ← mixedSeq.runIOParallel { maxConcurrent := some 1 }
+      let (_, out3) ← mixedSeq.runIOParallel { maxConcurrent := some 3 }
+      if seqOut == out1 && seqOut == out3 then pure (true, 0, 0, none)
+      else pure (false, 0, 0, some s!"j=1 match: {seqOut == out1}, j=3 match: {seqOut == out3}")
+    ) .done ++
+    .individualIO "failing property still reports failure" none (do
+      let (pass, out) ← mixedSeq.runIOParallel
+      if !pass && out.containsSub "bogus" && out.containsSub "Found problems!" then
+        pure (true, 0, 0, none)
+      else pure (false, 0, 0, some s!"expected a reported failure, got pass={pass}:\n{out}")
+    ) .done ++
+    .individualIO "indentation matches runIO at the same indent" none (do
+      let (_, seqOut) ← mixedSeq.runIO (indent := 4)
+      let (_, parOut) ← mixedSeq.runIOParallel (indent := 4)
+      if seqOut == parOut && seqOut.containsSub "    ✓ " then pure (true, 0, 0, none)
+      else pure (false, 0, 0, some s!"sequential:\n{seqOut}\nparallel:\n{parOut}")
+    ) .done ++
+    -- Uses a bounded pool of dedicated threads, so the speedup comes from overlapping
+    -- sleeps rather than from having multiple cores. Robust on single-core CI.
+    .individualIO "deferred tests actually overlap" none (do
+      let t0 ← IO.monoMsNow
+      let _ ← (sleepers 6 200).runIOParallel { maxConcurrent := some 6 }
+      let elapsed := (← IO.monoMsNow) - t0
+      -- Sequentially this is ~1200 ms; overlapped it should be near 200 ms.
+      if elapsed < 900 then pure (true, 0, 0, none)
+      else pure (false, 0, 0, some s!"6x200ms overlapped took {elapsed} ms (expected < 900)")
+    ) .done ++
+    .individualIO "same baseSeed replays, different baseSeed does not" none (do
+      let (_, a) ← mixedSeq.runIOParallel { baseSeed := 7 }
+      let (_, b) ← mixedSeq.runIOParallel { baseSeed := 7 }
+      let (_, c) ← mixedSeq.runIOParallel { baseSeed := 12345 }
+      if a == b && a != c then pure (true, 0, 0, none)
+      else pure (false, 0, 0, some s!"replay: {a == b}, differs: {a != c}")
+    ) .done ++
+    .individualIO "explicit cfg.randomSeed overrides the runner's seed" none (do
+      -- Both copies pin the same seed, so they must find the same counterexample even
+      -- though they sit at different positions in the sequence.
+      let tSeq := checkPlausibleIO "a" (∀ n : Nat, n < 40) .done { randomSeed := some 99 } ++
+                  checkPlausibleIO "b" (∀ n : Nat, n < 40) .done { randomSeed := some 99 }
+      let (_, out) ← tSeq.runIOParallel
+      let counterexamples := (out.splitOn "n := ").tail.map (·.takeWhile Char.isDigit)
+      match counterexamples with
+      | [x, y] =>
+        if x == y then pure (true, 0, 0, none)
+        else pure (false, 0, 0, some s!"pinned seed gave different counterexamples: {x} vs {y}")
+      | other => pure (false, 0, 0, some s!"expected 2 counterexamples, got {other}")
+    ) .done ++
+    .individualIO "positional seeds are distinct and decorrelated" none (do
+      -- 200 copies of one failing property must not all report the same counterexample.
+      let many := (List.range 200).foldr (init := .done) fun i acc =>
+        checkPlausibleIO s!"p{i}" (∀ n : Nat, n < 40) acc
+      let (_, out) ← many.runIOParallel
+      let vals := (out.splitOn "n := ").tail.map (·.takeWhile Char.isDigit)
+      if vals.length == 200 && vals.eraseDups.length > 1 then pure (true, 0, 0, none)
+      else pure (false, 0, 0,
+        some s!"got {vals.length} counterexamples, {vals.eraseDups.length} distinct")
+    ) .done ++
+    .individualIO "seedFor is injective" none (do
+      let seeds := (List.range 2000).map (LSpec.seedFor 0)
+      if seeds.eraseDups.length == seeds.length then pure (true, 0, 0, none)
+      else pure (false, 0, 0, some s!"only {seeds.eraseDups.length}/2000 distinct seeds")
+    ) .done ++
+    .individualIO "exceptions from deferred tests propagate" none (do
+      let boom : TestSeq := .individualIO "boom" none (throw (.userError "kaboom")) .done
+      try
+        let _ ← boom.runIOParallel
+        pure (false, 0, 0, some "expected the exception to propagate")
+      catch e =>
+        if (toString e).containsSub "kaboom" then pure (true, 0, 0, none)
+        else pure (false, 0, 0, some s!"unexpected error: {e}")
+    ) .done ++
+    .individualIO "degenerate sequences and pool sizes" none (do
+      let (d, dOut) ← TestSeq.done.runIOParallel
+      let (u, _) ← (test "pure" (1 = 1)).runIOParallel
+      -- `maxConcurrent := some 0` must still make progress rather than deadlock.
+      let (z, _) ← (sleepers 3 1).runIOParallel { maxConcurrent := some 0 }
+      if d && dOut.isEmpty && u && z then pure (true, 0, 0, none)
+      else pure (false, 0, 0, some s!"done={d} emptyOut={dOut.isEmpty} pure={u} j0={z}")
+    ) .done ++
+    .individualIO "spawnIO preserves shape and test count" none (do
+      let spawned ← mixedSeq.spawnIO
+      if spawned.numIOTests == mixedSeq.numIOTests then pure (true, 0, 0, none)
+      else pure (false, 0, 0,
+        some s!"spawned {spawned.numIOTests} IO tests, expected {mixedSeq.numIOTests}")
+    ) .done
+  )
+
+def lspecIOParallelTests : TestSeq :=
+  group "lspecIOParallel" (
+    .individualIO "returns 0 on all-pass" none (quietly do
+      let rc ← lspecIOParallel (.ofList [("s", [test "t" (1 = 1)])]) []
+      if rc == 0 then pure (true, 0, 0, none)
+      else pure (false, 0, 0, some s!"expected rc=0, got rc={rc}")
+    ) .done ++
+    .individualIO "returns 1 on any failure" none (quietly do
+      let rc ← lspecIOParallel (.ofList [("s", [test "t" (1 = 2)])]) []
+      if rc == 1 then pure (true, 0, 0, none)
+      else pure (false, 0, 0, some s!"expected rc=1, got rc={rc}")
+    ) .done ++
+    .individualIO "empty map returns 0" none (quietly do
+      let rc ← lspecIOParallel (.ofList []) []
+      if rc == 0 then pure (true, 0, 0, none)
+      else pure (false, 0, 0, some s!"expected rc=0, got rc={rc}")
+    ) .done ++
+    .individualIO "suite filtering by name prefix" none (quietly do
+      let map : Std.HashMap String (List TestSeq) := .ofList [
+        ("math.add", [test "t" (1 + 1 = 2)]),
+        ("string.bad", [test "t" (1 = 2)])
+      ]
+      -- Filtering out the failing suite must yield 0.
+      let rc ← lspecIOParallel map ["math"]
+      if rc == 0 then pure (true, 0, 0, none)
+      else pure (false, 0, 0, some s!"expected rc=0 with filter, got rc={rc}")
+    ) .done ++
+    .individualIO "non-matching filter runs nothing (returns 0)" none (quietly do
+      let rc ← lspecIOParallel (.ofList [("suite", [test "t" (1 = 2)])]) ["nonexistent"]
+      if rc == 0 then pure (true, 0, 0, none)
+      else pure (false, 0, 0, some s!"expected rc=0 with no matches, got rc={rc}")
+    ) .done ++
+    .individualIO "suites overlap in wall-clock time" none (quietly do
+      let slow : TestSeq :=
+        .individualIO "slow" none (do IO.sleep 200; pure (true, 0, 0, none)) .done
+      let map : Std.HashMap String (List TestSeq) :=
+        .ofList [("a", [slow]), ("b", [slow]), ("c", [slow]), ("d", [slow])]
+      let t0 ← IO.monoMsNow
+      let rc ← lspecIOParallel map [] { maxConcurrent := some 4 }
+      let elapsed := (← IO.monoMsNow) - t0
+      if rc == 0 && elapsed < 600 then pure (true, 0, 0, none)
+      else pure (false, 0, 0, some s!"rc={rc}, 4 suites x 200ms took {elapsed} ms")
+    ) .done
+  )
+
 /-! ## lspecIO integration -/
 
 def lspecIOIntegration : TestSeq :=
@@ -233,6 +401,10 @@ where
         pure (ok, 0, 0, none)
       ) (go n)
 
+-- NOTE: the outer runner is deliberately `lspecIO`, not `lspecIOParallel`. Several tests here
+-- use `quietly`, which swaps the *process-global* stdout/stderr; running those concurrently
+-- with tests that print would swallow output nondeterministically. This suite is itself an
+-- example of the "tests must be independent" caveat on the parallel runners.
 def main (args : List String) : IO UInt32 := do
   let runMemory := args.contains "memory"
   let primarySuites : Std.HashMap String (List TestSeq) := .ofList [
@@ -243,6 +415,8 @@ def main (args : List String) : IO UInt32 := do
     ("Append", [appendTests]),
     ("Property tests", [propertyTests]),
     ("Plausible property tests", [plausiblePropertyTests]),
+    ("Parallel runner", [parallelTests]),
+    ("lspecIOParallel", [lspecIOParallelTests]),
     ("lspecIO integration", [lspecIOIntegration]),
     ("lspecEachIO", [lspecEachIOTests])
   ]

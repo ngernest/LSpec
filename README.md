@@ -197,3 +197,75 @@ reproducible runs (or otherwise customise the `Plausible.Configuration`), call t
 def reproducible : TestSeq :=
   checkPlausibleIO "add_comm" (∀ n m : Nat, n + m = m + n) .done { randomSeed := some 42 }
 ```
+
+## Running properties in parallel
+
+Property tests are independent and CPU-bound, so they are worth running concurrently — the same
+idea as Haskell's [`tasty`](https://github.com/UnkindPartition/tasty). The module
+[LSpec.Parallel](LSpec/Parallel.lean) provides drop-in parallel counterparts to the runtime
+runners:
+
+| Sequential | Parallel |
+|------------|----------|
+| `TestSeq.runIO` | `TestSeq.runIOParallel` |
+| `lspecIO` | `lspecIOParallel` |
+
+```lean
+def props : TestSeq :=
+  checkPlausibleIO' "add_comm"   (∀ n m : Nat, n + m = m + n) ++
+  checkPlausibleIO' "mul_comm"   (∀ n m : Nat, n * m = m * n) ++
+  checkPlausibleIO' "append_nil" (∀ l : List Nat, l ++ [] = l)
+
+def main : IO UInt32 := lspecIOParallel (.ofList [("props", [props])]) []
+```
+
+Like `tasty`, scheduling is separated from reporting: every deferred test is launched at once,
+then the reporter walks the sequence in its original order and blocks on each result in turn.
+Output is therefore **byte-for-byte identical** to the sequential runner — same order, same
+samples, same counterexamples, same exit code — only faster.
+
+`ParallelConfig` controls the two knobs:
+
+```lean
+-- One worker per core (the default); override globally with LEAN_NUM_THREADS.
+props.runIOParallel
+
+-- `tasty`'s `-j 4`: a pool of exactly four dedicated threads.
+props.runIOParallel { maxConcurrent := some 4 }
+
+-- Replay an entire run, seeds included.
+props.runIOParallel { baseSeed := 42 }
+```
+
+### Seeding and reproducibility
+
+Plausible and SlimCheck both draw randomness from a global `stdGenRef`, which — per Plausible's
+own documentation — "is not thread local, hence two threads accessing it at the same time will
+get the exact same generator". Sharing it across threads would both race on the write-back and
+silently collapse coverage.
+
+So deferred property tests no longer touch it. Each takes a seed derived from its **position**
+in the sequence, `seedFor baseSeed i`, spread with the SplitMix64 finalizer so that neighbouring
+tests get uncorrelated sample streams. Samples then depend only on `baseSeed` and position, never
+on scheduling order, which is what makes the parallel and sequential runners agree. A failing
+property reports the seed that produced it:
+
+```
+× ∃⁴⁵/₁₀₀: "bogus" (∀ n : Nat, n < 40)
+    Found problems!
+    n := 42
+    (replay with randomSeed := 7960286522194355700)
+```
+
+An explicit `cfg.randomSeed` always wins over the runner-supplied seed, so pinned tests stay
+pinned.
+
+### Caveats
+
+* Only **deferred** tests are parallelised. `test`, `check` and `checkPlausible` are evaluated
+  during elaboration and are already values by the time a runner sees them.
+* Tests must be **independent**. A test that touches shared mutable state, the process-wide
+  stdout, the working directory, or a fixed port is not safe here — keep those on `runIO`.
+  (LSpec's own suite is an example: it swaps global stdout, so it runs sequentially.)
+* `lspecIOParallel` holds every suite live at once, giving up `lspecIO`'s incremental memory
+  behaviour. Prefer `lspecIO` for suites that are memory-heavy rather than time-heavy.

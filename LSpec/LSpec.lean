@@ -14,6 +14,10 @@ LSpec provides three main ways to define tests:
 - **`check`/`check'`**: For property-based tests using SlimCheck, evaluated at compile time
 - **`checkIO`/`checkIO'`**: For property-based tests evaluated at runtime with configurable seeds
 
+Runtime tests are run by `TestSeq.runIO`/`lspecIO`. See `LSpec.Parallel` for
+`TestSeq.runIOParallel`/`lspecIOParallel`, which run deferred tests concurrently while
+producing identical output.
+
 ## Quick Start
 
 ```lean
@@ -115,7 +119,9 @@ A sequence of tests to be executed.
 
 Constructors:
 - `individual`: A compile-time test with a description, proposition, optional property string, and proof of testability
-- `individualIO`: A deferred IO test that runs at execution time (used by `checkIO`)
+- `individualIO`: A deferred IO test that runs at execution time
+- `individualSeededIO`: A deferred IO test whose action is parameterised by an RNG seed supplied
+  by the runner (used by `checkIO`/`checkPlausibleIO`)
 - `group`: A named group of tests for organized output
 - `done`: Marks the end of a test sequence
 
@@ -136,6 +142,8 @@ For `individualIO`, the action returns `(success, numSamples, totalTests, errorM
 inductive TestSeq
   | individual : String → (prop : Prop) → (propString : Option String) → Testable prop → TestSeq → TestSeq
   | individualIO : String → (propString : Option String) → IO (Bool × Nat × Nat × Option String) → TestSeq → TestSeq
+  | individualSeededIO : String → (propString : Option String) →
+      (Nat → IO (Bool × Nat × Nat × Option String)) → TestSeq → TestSeq
   | group : String → TestSeq → TestSeq → TestSeq
   | done
 
@@ -144,6 +152,7 @@ def TestSeq.append : TestSeq → TestSeq → TestSeq
   | done, t => t
   | individual d p ps i n, t' => individual d p ps i $ n.append t'
   | individualIO d ps action n, t' => individualIO d ps action $ n.append t'
+  | individualSeededIO d ps action n, t' => individualSeededIO d ps action $ n.append t'
   | group d ts n, t' => group d ts $ n.append t'
 
 instance : Append TestSeq where
@@ -234,13 +243,18 @@ Use `lspecIO` or `lspecEachIO` to execute them.
 def checkIO (descr : String) (p : Prop) (next : TestSeq := .done) (cfg : Configuration := {})
     (propString : Option String := none)
     (p' : DecorationsOf p := by mk_decorations) [Checkable p'] : TestSeq :=
-  let action : IO (Bool × Nat × Nat × Option String) := do
+  let action (seed : Nat) : IO (Bool × Nat × Nat × Option String) := do
+    -- An explicit `cfg.randomSeed` always wins; otherwise use the runner-supplied seed rather
+    -- than the shared global `stdGenRef`, which is not thread-safe.
+    let cfg := { cfg with randomSeed := cfg.randomSeed <|> some seed }
     let (result, numSamples) ← Checkable.checkIO p' cfg
     match result with
     | .success _ => pure (true, numSamples, cfg.numInst, none)
     | .gaveUp n => pure (false, 0, cfg.numInst, some s!"Gave up {n} times")
-    | .failure _ xs n => pure (false, numSamples, cfg.numInst, some $ Checkable.formatFailure "Found problems!" xs n)
-  .individualIO descr propString action next
+    | .failure _ xs n =>
+      let msg := Checkable.formatFailure "Found problems!" xs n
+      pure (false, numSamples, cfg.numInst, some s!"{msg}\n    (replay with randomSeed := {cfg.randomSeed.getD seed})")
+  .individualSeededIO descr propString action next
 
 section SyntaxCapturingMacros
 open Lean in
@@ -367,6 +381,67 @@ def formatFailureLine (descr : String) (propString : Option String)
     -- Unit test failure: × ∃: descr
     s!"∃: {descr}"
 
+section Seeding
+
+/--
+Derives the RNG seed for the `idx`-th deferred test in a `TestSeq` from a `baseSeed`.
+
+Structured seeds make poor `mkStdGen` input: `mkStdGen s = ⟨s % 2147483562 + 1,
+s / 2147483562 % 2147483398 + 1⟩` merely slices `s`, so seeds that differ in a simple way
+(consecutive integers, or a fixed stride) produce visibly correlated sample streams — adjacent
+tests would then explore near-identical values. The SplitMix64 finalizer is applied to
+decorrelate: it avalanches every input bit across all 64 output bits, so consecutive indices
+yield unrelated seeds.
+-/
+def seedFor (baseSeed idx : Nat) : Nat :=
+  -- Weyl-sequence step, then two xor-shift-multiply rounds (SplitMix64's `mix64`).
+  let z : UInt64 := (UInt64.ofNat baseSeed) + (UInt64.ofNat idx) * 0x9E3779B97F4A7C15
+  let z := (z ^^^ (z >>> 30)) * 0xBF58476D1CE4E5B9
+  let z := (z ^^^ (z >>> 27)) * 0x94D049BB133111EB
+  (z ^^^ (z >>> 31)).toNat
+
+/--
+Replaces every `individualSeededIO` node with an `individualIO` node whose action has been
+applied to `seedFor baseSeed i`, where `i` is the node's position in a left-to-right traversal
+of the sequence.
+
+Seeding by *position* rather than by consuming a shared global RNG (Plausible's and SlimCheck's
+`stdGenRef`) is what makes deferred property tests safe to run concurrently: each test's samples
+depend only on its index and the `baseSeed`, so results are reproducible and independent of
+scheduling order. It also means `TestSeq.runIO` and `TestSeq.runIOParallel` produce identical
+output for the same sequence.
+-/
+def TestSeq.assignSeeds (tSeq : TestSeq) (baseSeed : Nat := 0) : TestSeq :=
+  (go tSeq 0).1
+where
+  /-- Returns the rewritten sequence along with the next unused test index. -/
+  go : TestSeq → Nat → TestSeq × Nat
+    | .done, idx => (.done, idx)
+    | .individual d p ps i n, idx =>
+      let (n', idx') := go n idx
+      (.individual d p ps i n', idx')
+    | .individualIO d ps action n, idx =>
+      let (n', idx') := go n idx
+      (.individualIO d ps action n', idx')
+    | .individualSeededIO d ps action n, idx =>
+      let (n', idx') := go n (idx + 1)
+      (.individualIO d ps (action (seedFor baseSeed idx)) n', idx')
+    | .group d ts n, idx =>
+      let (ts', idx') := go ts idx
+      let (n', idx'') := go n idx'
+      (.group d ts' n', idx'')
+
+/-- The number of deferred (`IO`) tests in a sequence, i.e. how many tests a parallel
+    runner can schedule concurrently. -/
+def TestSeq.numIOTests : TestSeq → Nat
+  | .done => 0
+  | .individual _ _ _ _ n => n.numIOTests
+  | .individualIO _ _ _ n => 1 + n.numIOTests
+  | .individualSeededIO _ _ _ n => 1 + n.numIOTests
+  | .group _ ts n => ts.numIOTests + n.numIOTests
+
+end Seeding
+
 /--
 Pure runner for `TestSeq`. Returns `(success, output)` where `success` is `true`
 if all tests passed.
@@ -416,29 +491,24 @@ def TestSeq.run (tSeq : TestSeq) (indent := 0) : Bool × String :=
     | .individualIO d propStr _ n =>
       let line := formatSuccessLine d propStr false 0
       aux s!"{acc}{pad}? {line} (IO test skipped in pure runner)\n" n
+    | .individualSeededIO d propStr _ n =>
+      let line := formatSuccessLine d propStr false 0
+      aux s!"{acc}{pad}? {line} (IO test skipped in pure runner)\n" n
   aux "" tSeq
 
 /--
-IO runner for `TestSeq`. Returns `(success, output)` where `success` is `true`
-if all tests passed.
+The recursive core of `TestSeq.runIO`, which assumes seeds have already been assigned by
+`TestSeq.assignSeeds`. Any `individualSeededIO` node still present is run with seed `0`.
 
-Unlike `TestSeq.run`, this runner executes both `individual` and `individualIO` tests,
-making it suitable for running `checkIO` property tests at runtime.
-
-Used by `lspecIO` and `lspecEachIO` for runtime test execution.
-
-Output format:
-- Unit tests: `✓ ∃: test name`
-- Property tests with universal proof: `✓ ∀: "descr" ∀ n m, ...`
-- Property tests without proof: `✓ ∃₁₀₀: "descr" ∀ n m, ...`
-- Failed property tests: `× ∃ₙ: "descr" ∀ n m, ... (counter-example)`
+Prefer `TestSeq.runIO` (or `TestSeq.runIOParallel`) as the entry point; this is exposed so
+that the parallel runner can reuse the exact same rendering logic.
 -/
-def TestSeq.runIO (tSeq : TestSeq) (indent := 0) : IO (Bool × String) := do
+def TestSeq.runIOAux (tSeq : TestSeq) (indent := 0) : IO (Bool × String) := do
   let pad := String.ofList $ List.replicate indent ' '
   let rec aux (acc : String) : TestSeq → IO (Bool × String)
     | .done => pure (true, acc)
     | .group d ts n => do
-      let (pass, msg) ← ts.runIO (indent + 2)
+      let (pass, msg) ← ts.runIOAux (indent + 2)
       let (b, m) ← aux s!"{acc}{pad}{d}:\n{msg}" n
       pure (pass && b, m)
     -- Test with formal proof
@@ -474,7 +544,40 @@ def TestSeq.runIO (tSeq : TestSeq) (indent := 0) : IO (Bool × String) := do
         let line := formatFailureLine d propStr (numSamples + 1) totalTests
         let (_b, m) ← aux s!"{acc}{pad}× {line}{formatErrorMsg msgOpt}\n" n
         pure (false, m)
+    -- Seeded IO property test that `assignSeeds` did not reach; fall back to seed `0`
+    | .individualSeededIO d propStr action n => do
+      let (success, numSamples, totalTests, msgOpt) ← action 0
+      if success then
+        let line := formatSuccessLine d propStr false numSamples
+        aux s!"{acc}{pad}✓ {line}\n" n
+      else
+        let line := formatFailureLine d propStr (numSamples + 1) totalTests
+        let (_b, m) ← aux s!"{acc}{pad}× {line}{formatErrorMsg msgOpt}\n" n
+        pure (false, m)
   aux "" tSeq
+
+/--
+IO runner for `TestSeq`. Returns `(success, output)` where `success` is `true`
+if all tests passed.
+
+Unlike `TestSeq.run`, this runner executes `individual`, `individualIO` and
+`individualSeededIO` tests, making it suitable for running `checkIO`/`checkPlausibleIO`
+property tests at runtime.
+
+Deferred property tests are seeded by position via `TestSeq.assignSeeds`, so runs are
+reproducible: passing the same `baseSeed` replays exactly the same samples. Tests run one
+after another; see `TestSeq.runIOParallel` to run them concurrently with identical output.
+
+Used by `lspecIO` and `lspecEachIO` for runtime test execution.
+
+Output format:
+- Unit tests: `✓ ∃: test name`
+- Property tests with universal proof: `✓ ∀: "descr" ∀ n m, ...`
+- Property tests without proof: `✓ ∃₁₀₀: "descr" ∀ n m, ...`
+- Failed property tests: `× ∃ₙ: "descr" ∀ n m, ... (counter-example)`
+-/
+def TestSeq.runIO (tSeq : TestSeq) (indent := 0) (baseSeed : Nat := 0) : IO (Bool × String) :=
+  (tSeq.assignSeeds baseSeed).runIOAux indent
 
 end TestSequences
 
