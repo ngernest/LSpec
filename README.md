@@ -197,3 +197,98 @@ reproducible runs (or otherwise customise the `Plausible.Configuration`), call t
 def reproducible : TestSeq :=
   checkPlausibleIO "add_comm" (∀ n m : Nat, n + m = m + n) .done { randomSeed := some 42 }
 ```
+
+## Running properties in parallel
+
+Property tests are independent and CPU-bound, so they are worth running concurrently. The module
+[LSpec.Parallel](LSpec/Parallel.lean) provides drop-in parallel counterparts to the runtime
+runners:
+
+| Sequential | Parallel |
+|------------|----------|
+| `TestSeq.runIO` | `TestSeq.runIOParallel` |
+| `lspecIO` | `lspecIOParallel` |
+
+```lean
+def props : TestSeq :=
+  checkPlausibleIO' "add_comm"   (∀ n m : Nat, n + m = m + n) ++
+  checkPlausibleIO' "mul_comm"   (∀ n m : Nat, n * m = m * n) ++
+  checkPlausibleIO' "append_nil" (∀ l : List Nat, l ++ [] = l)
+
+def main : IO UInt32 := lspecIOParallel (.ofList [("props", [props])]) []
+```
+
+Scheduling is separated from reporting: every deferred test is launched at once, then the
+reporter walks the sequence in its original order and blocks on each result in turn.
+Output is therefore **byte-for-byte identical** to the sequential runner — same order, same
+samples, same counterexamples, same exit code — only faster.
+
+`ParallelConfig` controls the two knobs:
+
+```lean
+-- Up to `numCores` tests at once (the default).
+props.runIOParallel
+
+-- At most four tests in flight.
+props.runIOParallel { maxConcurrent := some 4 }
+
+-- Replay an entire run, seeds included.
+props.runIOParallel { baseSeed := 42 }
+```
+
+`maxConcurrent` defaults to `LSpec.numCores`, the number of CPU cores available to the process.
+It is read from `LEAN_NUM_THREADS` if set (that variable also bounds Lean's own scheduler), then
+`NUMBER_OF_PROCESSORS` on Windows, then `sysctl -n hw.logicalcpu` or `nproc`, and is memoised for
+the process.
+
+The cap is a thread pool built from the standard library's concurrency types: `n` workers pull
+tests off one shared [`Std.CloseableChannel`](https://lean-lang.org/doc/reference/latest/IO/Tasks-and-Threads/),
+and each publishes its test's result to an `IO.Promise` that the renderer waits on. A worker runs
+one test at a time, so at most `n` are in flight; the queue is shared, so whichever worker is free
+takes the next test and one slow property never holds up work the others could do. Closing the
+queue after everything is enqueued is what retires the workers — a closed channel still delivers
+what is already queued, then resolves its consumers to `none`.
+
+`lspecIOParallel` uses a single queue and pool for every suite, so the cap bounds the whole run
+rather than each suite. Workers run on dedicated threads, which reach full concurrency
+immediately; regular-priority pool tasks ramp up lazily and measured slower on suites of many
+short tests.
+
+### Seeding and reproducibility
+
+Plausible and SlimCheck both draw randomness from a global `stdGenRef`, which — per Plausible's
+own documentation — "is not thread local, hence two threads accessing it at the same time will
+get the exact same generator". Sharing it across threads would both race on the write-back and
+silently collapse coverage.
+
+So deferred property tests no longer touch it. Each takes a seed derived from its **position**
+in the sequence, `seedFor baseSeed i`. Samples then depend only on `baseSeed` and position, never
+on scheduling order, which is what makes the parallel and sequential runners agree.
+
+`seedFor` mixes rather than just returning `baseSeed + i`, because `mkStdGen` only slices its
+input, which would leave the `k`-th sample across tests in an arithmetic progression. That costs
+coverage at the low positions: over 200 tests drawing from `0..999`, unmixed seeds give a first
+sample that is odd every single time. See `LSpec.seedFor` for the details and the limits of the
+effect.
+
+A failing property reports the seed that produced it:
+
+```
+× ∃⁴⁵/₁₀₀: "bogus" (∀ n : Nat, n < 40)
+    Found problems!
+    n := 42
+    (replay with randomSeed := 7960286522194355700)
+```
+
+An explicit `cfg.randomSeed` always wins over the runner-supplied seed, so pinned tests stay
+pinned.
+
+### Caveats
+
+* Only **deferred** tests are parallelised. `test`, `check` and `checkPlausible` are evaluated
+  during elaboration and are already values by the time a runner sees them.
+* Tests must be **independent**. A test that touches shared mutable state, the process-wide
+  stdout, the working directory, or a fixed port is not safe here — keep those on `runIO`.
+  (LSpec's own suite is an example: it swaps global stdout, so it runs sequentially.)
+* `lspecIOParallel` holds every suite live at once, giving up `lspecIO`'s incremental memory
+  behaviour. Prefer `lspecIO` for suites that are memory-heavy rather than time-heavy.

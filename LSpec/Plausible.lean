@@ -117,13 +117,19 @@ Use `lspecIO` or `lspecEachIO` to execute them.
 def checkPlausibleIO (descr : String) (p : Prop) (next : TestSeq := .done)
     (cfg : Plausible.Configuration := {}) (propString : Option String := none)
     (p' : DecorationsOf p := by mk_decorations) [Plausible.Testable p'] : TestSeq :=
-  let action : IO (Bool × Nat × Nat × Option String) := do
+  let action (seed : Nat) : IO (Bool × Nat × Nat × Option String) := do
+    -- An explicit `cfg.randomSeed` always wins; otherwise fall back to the seed supplied by the
+    -- runner instead of Plausible's shared global `stdGenRef`. `stdGenRef` is not thread-local, so
+    -- concurrent readers would observe the same generator and race on the write-back.
+    let cfg := { cfg with randomSeed := cfg.randomSeed <|> some seed }
     match ← runPlausibleSuiteIO p' cfg with
     | (.success _, _) => pure (true, cfg.numInst, cfg.numInst, none)
     | (.gaveUp n, _) => pure (false, 0, cfg.numInst, some s!"Gave up {n} times")
     | (.failure _ xs n, numSamples) =>
-      pure (false, numSamples, cfg.numInst, some $ Plausible.Testable.formatFailure "Found problems!" xs n)
-  .individualIO descr propString action next
+      let msg := Plausible.Testable.formatFailure "Found problems!" xs n
+      pure (false, numSamples, cfg.numInst,
+        some s!"{msg}\n    (replay with randomSeed := {cfg.randomSeed.getD seed})")
+  .individualSeededIO descr propString action next
 
 section SyntaxCapturingMacros
 open Lean in
