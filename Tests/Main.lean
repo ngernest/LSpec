@@ -231,6 +231,33 @@ def parallelTests : TestSeq :=
       if elapsed < 900 then pure (true, 0, 0, none)
       else pure (false, 0, 0, some s!"6x200ms overlapped took {elapsed} ms (expected < 900)")
     ) .done ++
+    .individualIO "numCores is positive and honours LEAN_NUM_THREADS" none (do
+      let cores ← numCores
+      if cores == 0 then
+        pure (false, 0, 0, some "numCores returned 0")
+      else
+        -- When the variable is set, it wins, since it also bounds Lean's own scheduler.
+        match ← IO.getEnv "LEAN_NUM_THREADS" with
+        | some raw =>
+          match raw.trimAscii.toNat? with
+          | some n =>
+            if n == 0 || cores == n then pure (true, 0, 0, none)
+            else pure (false, 0, 0, some s!"LEAN_NUM_THREADS={n} but numCores={cores}")
+          | none => pure (true, 0, 0, none)
+        | none => pure (true, 0, 0, none)
+    ) .done ++
+    -- The default `maxConcurrent := none` must actually reach `numCores` tests at once, given
+    -- enough work to do so.
+    .individualIO "the default concurrency is numCores" none (do
+      let cores ← numCores
+      let live ← IO.mkRef 0
+      let peak ← IO.mkRef 0
+      let _ ← (probes live peak (cores * 2)).runIOParallel
+      let observed ← peak.get
+      if observed == cores && (← live.get) == 0 then pure (true, 0, 0, none)
+      else pure (false, 0, 0,
+        some s!"peak={observed} with {cores * 2} tests, expected numCores={cores}")
+    ) .done ++
     -- The chains built by `IO.bindTask` must bound the tests in flight exactly, not just
     -- roughly: with `maxConcurrent := some n` the peak must be `min n (number of tests)`.
     .individualIO "maxConcurrent bounds the tests in flight exactly" none (do

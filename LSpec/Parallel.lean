@@ -35,16 +35,22 @@ the sequential one and a failing test can be replayed with the reported `randomS
 
 ## Concurrency level
 
-- `maxConcurrent := none` (default): each test becomes a regular-priority `Task`. Lean's task
-  scheduler allocates no more workers than there are cores, so this is the analogue of `tasty`'s
-  default `-j <numCores>`. Override with the `LEAN_NUM_THREADS` environment variable.
-- `maxConcurrent := some n`: the tests are split into `n` chains of tasks linked by
-  `IO.bindTask`, the analogue of passing `-j n`.
+`ParallelConfig.maxConcurrent` caps the tests in flight. It defaults to `numCores`, the number
+of CPU cores available to the process, which is what `tasty` uses for `-j` and what Turnt's
+`ThreadPoolExecutor` picks up from Python. `some n` overrides it.
 
-Both levels are built only from the task combinators in `Init.System.IO` — `IO.asTask` to launch
-a test and `IO.bindTask` to make one test wait for another. There is no lock, no shared counter
-and no promise anywhere: every ordering constraint is expressed as a dependency between tasks,
-which is what the reference manual recommends over blocking on results.
+The cap is implemented by linking the tests into `n` chains with `IO.bindTask`: test `i` waits
+for test `i - n`, so at most `n` run at once. Together with `IO.asTask` to launch a test, that is
+the whole mechanism — there is no lock, no shared counter and no promise anywhere. Every ordering
+constraint is a dependency between tasks, which is what the reference manual recommends over
+blocking on results.
+
+Chains are a static round-robin split rather than a work-stealing queue. On a skewed suite whose
+slow tests happen to land in the same chain (their indices agreeing modulo `n`) this can cost
+roughly a factor of two against an ideal schedule. In exchange, the tests run on dedicated
+threads, which the reference manual recommends for long-running work and which reach full
+concurrency immediately; regular-priority pool tasks ramp up lazily and were measurably slower
+on suites of many short tests.
 
 ## Caveats
 
@@ -59,12 +65,50 @@ which is what the reference manual recommends over blocking on results.
 namespace LSpec
 public section
 
+/-- Memoises `numCores`, whose detection may cost a subprocess. -/
+private initialize numCoresCache : IO.Ref (Option Nat) ← IO.mkRef none
+
+/--
+The number of tests to run at once by default: the number of CPU cores available to the process.
+This is the same default that `tasty` uses for `-j`, and that Turnt's thread pool picks up from
+Python's `ThreadPoolExecutor`.
+
+Resolved in this order:
+
+1. `LEAN_NUM_THREADS`, since that is what bounds Lean's own task scheduler.
+2. `NUMBER_OF_PROCESSORS`, which Windows publishes in the environment.
+3. `sysctl -n hw.logicalcpu` on macOS, `nproc` elsewhere.
+4. `1` if none of the above answer, which runs the tests one at a time.
+
+Lean's core count is only reachable through an internal symbol that the interpreter cannot
+resolve, which would break `#eval` on the parallel runners, so the count is read from the
+environment or the OS instead. The runners resolve it once per run, not once per suite.
+-/
+def numCores : BaseIO Nat := do
+  -- Detection can cost a subprocess, so only ever do it once per process.
+  if let some cached ← numCoresCache.get then return cached
+  let detected ← detect
+  numCoresCache.set (some detected)
+  return detected
+where
+  detect : BaseIO Nat := do
+    if let some n ← envNat "LEAN_NUM_THREADS" then return n
+    if let some n ← envNat "NUMBER_OF_PROCESSORS" then return n
+    let (cmd, args) :=
+      if System.Platform.isOSX then ("sysctl", #["-n", "hw.logicalcpu"]) else ("nproc", #[])
+    match ← (IO.Process.output { cmd, args }).toBaseIO with
+    | .ok out => return max 1 (out.stdout.trimAscii.toNat?.getD 1)
+    | .error _ => return 1
+  /-- Reads a positive `Nat` from the environment variable `name`. -/
+  envNat (name : String) : BaseIO (Option Nat) := do
+    let some raw ← IO.getEnv name | return none
+    return (raw.trimAscii.toNat?).filter (· > 0)
+
 /-- Configuration for the parallel `TestSeq` runners. -/
 structure ParallelConfig where
   /--
-  Maximum number of tests to run at once. `none` defers to Lean's task scheduler, which uses
-  one worker per core (configurable via `LEAN_NUM_THREADS`). `some n` splits the tests into `n`
-  chains of tasks, so at most `n` are ever in flight; `some 0` is treated as `some 1`.
+  Maximum number of tests to run at once. `none`, the default, uses `numCores`. `some n` runs at
+  most `n` tests at once; `some 0` is treated as `some 1`, which runs them one at a time.
   -/
   maxConcurrent : Option Nat := none
   /--
@@ -85,21 +129,6 @@ private def awaitTask (task : Task (Except IO.Error IOTestOutcome)) : IO IOTestO
   match ← IO.wait task with
   | .ok outcome => pure outcome
   | .error e => throw e
-
-/-- Launches every deferred test as its own regular-priority `Task`, letting Lean's scheduler
-    bound the concurrency to the number of cores. -/
-private def spawnUnbounded : TestSeq → BaseIO TestSeq
-  | .done => pure .done
-  | .individual d p ps i n => (.individual d p ps i) <$> spawnUnbounded n
-  | .individualIO d ps action n => do
-    let task ← IO.asTask action
-    pure <| .individualIO d ps (awaitTask task) (← spawnUnbounded n)
-  | .individualSeededIO d ps action n =>
-    -- Unreachable after `assignSeeds`; kept total so the traversal cannot silently drop a test.
-    (.individualSeededIO d ps action) <$> spawnUnbounded n
-  | .group d ts n => do
-    let ts' ← spawnUnbounded ts
-    pure <| .group d ts' (← spawnUnbounded n)
 
 /--
 The tasks launched so far, in traversal order. Threading this through successive `TestSeq`s is
@@ -122,8 +151,13 @@ prints them in sequence order.
 
 The chains are a static round-robin split rather than a work-stealing queue, so one very slow
 property delays the rest of its chain. That is the trade for needing no shared mutable state;
-with more tests than chains the imbalance averages out. Use the default `maxConcurrent := none`
-to let Lean's scheduler balance the work itself.
+with more tests than chains the imbalance averages out, and the worst case is a suite whose slow
+tests all have indices agreeing modulo `n`.
+
+The tasks are `Task.Priority.dedicated`. Only `n` of them exist at a time, since a chain's next
+task is created by the continuation of its previous one, so this costs at most `n` threads. The
+reference manual recommends dedicated threads for long-running work, and they reach full
+concurrency at once instead of ramping up like the regular-priority pool.
 -/
 private def spawnChained (n : Nat) : TestSeq → SpawnState → BaseIO (TestSeq × SpawnState) :=
   go
@@ -158,14 +192,12 @@ where
       let (next', started) ← go next started
       pure (.group d ts' next', started)
 
-/-- Assigns seeds, then spawns, continuing the chains recorded in `started` so that a caller
-    spawning several `TestSeq`s in turn keeps one shared concurrency bound across all of them. -/
-private def spawnIOFrom (cfg : ParallelConfig) (tSeq : TestSeq) (started : SpawnState) :
-    BaseIO (TestSeq × SpawnState) := do
-  let seeded := tSeq.assignSeeds cfg.baseSeed
-  match cfg.maxConcurrent with
-  | none => (·, started) <$> spawnUnbounded seeded
-  | some n => spawnChained (max n 1) seeded started
+/-- Assigns seeds, then spawns with `n` chains, continuing the chains recorded in `started` so
+    that a caller spawning several `TestSeq`s in turn keeps one shared concurrency bound across
+    all of them. `n` is the already-resolved concurrency, so `numCores` is only read once a run. -/
+private def spawnIOFrom (n : Nat) (cfg : ParallelConfig) (tSeq : TestSeq) (started : SpawnState) :
+    BaseIO (TestSeq × SpawnState) :=
+  spawnChained (max n 1) (tSeq.assignSeeds cfg.baseSeed) started
 
 /--
 Starts every deferred test in `tSeq` running concurrently and returns a `TestSeq` of the same
@@ -176,8 +208,11 @@ This is the scheduling half of the runner; pass the result to `TestSeq.runIOAux`
 caller can spawn several independent `TestSeq`s and only then start printing, which is how
 `lspecIOParallel` overlaps work across suites.
 -/
-def TestSeq.spawnIO (tSeq : TestSeq) (cfg : ParallelConfig := {}) : BaseIO TestSeq :=
-  Prod.fst <$> spawnIOFrom cfg tSeq #[]
+def TestSeq.spawnIO (tSeq : TestSeq) (cfg : ParallelConfig := {}) : BaseIO TestSeq := do
+  let n ← match cfg.maxConcurrent with
+    | some n => pure n
+    | none => numCores
+  Prod.fst <$> spawnIOFrom n cfg tSeq #[]
 
 end Spawning
 
@@ -195,10 +230,10 @@ def props : TestSeq :=
   checkPlausibleIO' "mul_comm"  (∀ n m : Nat, n * m = m * n) ++
   checkPlausibleIO' "append_nil" (∀ l : List Nat, l ++ [] = l)
 
--- All three properties are tested at the same time.
+-- Runs up to `numCores` properties at a time.
 #eval do let (ok, out) ← props.runIOParallel; IO.println out; pure ok
 
--- Cap concurrency at two threads and replay a specific run.
+-- Cap concurrency at two tests and replay a specific run.
 #eval props.runIOParallel { maxConcurrent := some 2, baseSeed := 42 }
 ```
 -/
@@ -239,12 +274,15 @@ def lspecIOParallel (map : HashMap String (List TestSeq)) (args : List String)
 
   -- Schedule everything first so that suites overlap, then render in order. The spawn state is
   -- threaded across suites so `maxConcurrent` bounds the whole run, not each suite separately.
+  let n ← match cfg.maxConcurrent with
+    | some n => pure n
+    | none => numCores
   let mut started : SpawnState := #[]
   let mut spawned : Array (String × List TestSeq) := #[]
   for (key, tSeqs) in entries do
     let mut spawnedSeqs : Array TestSeq := #[]
     for tSeq in tSeqs do
-      let (tSeq', started') ← spawnIOFrom cfg tSeq started
+      let (tSeq', started') ← spawnIOFrom n cfg tSeq started
       started := started'
       spawnedSeqs := spawnedSeqs.push tSeq'
     spawned := spawned.push (key, spawnedSeqs.toList)

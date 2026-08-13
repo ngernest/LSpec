@@ -227,7 +227,7 @@ samples, same counterexamples, same exit code — only faster.
 `ParallelConfig` controls the two knobs:
 
 ```lean
--- One worker per core (the default); override globally with LEAN_NUM_THREADS.
+-- Up to `numCores` tests at once (the default).
 props.runIOParallel
 
 -- `tasty`'s `-j 4`: at most four tests in flight.
@@ -237,18 +237,24 @@ props.runIOParallel { maxConcurrent := some 4 }
 props.runIOParallel { baseSeed := 42 }
 ```
 
-Both levels are built only from the task combinators in the standard library: `IO.asTask` to
-launch a test, and `IO.bindTask` to make one test wait for another. `maxConcurrent := some n`
-links the tests into `n` chains, so test `i` starts only once test `i - n` has finished. That
-caps the tests in flight at `n` with no lock, no shared counter and no promise — the ordering
+`maxConcurrent` defaults to `LSpec.numCores`, the number of CPU cores available to the process —
+the same default `tasty` uses for `-j`, and the one Turnt's `ThreadPoolExecutor` inherits from
+Python. It is read from `LEAN_NUM_THREADS` if set (that variable also bounds Lean's own
+scheduler), then `NUMBER_OF_PROCESSORS` on Windows, then `sysctl -n hw.logicalcpu` or `nproc`,
+and is memoised for the process.
+
+The cap is built only from the task combinators in the standard library: `IO.asTask` launches a
+test, and `IO.bindTask` links the tests into `n` chains so that test `i` starts only once test
+`i - n` has finished. There is no lock, no shared counter and no promise — the ordering
 constraint is carried by the tasks themselves, which is what the
 [reference manual](https://lean-lang.org/doc/reference/latest/IO/Tasks-and-Threads/) recommends
-over blocking on results. `lspecIOParallel` threads the chains across suites, so `n` bounds the
-whole run rather than each suite.
+over blocking on results. `lspecIOParallel` threads the chains across suites, so the cap bounds
+the whole run rather than each suite.
 
-The chains are a static round-robin split, not a work-stealing queue, so one very slow property
-delays the rest of its chain. Leave `maxConcurrent := none` to let Lean's scheduler balance the
-work itself.
+The chains are a static round-robin split, not a work-stealing queue. A suite whose slow tests
+all have indices agreeing modulo `n` can cost about twice an ideal schedule. In exchange the
+tests run on dedicated threads, which reach full concurrency immediately — regular-priority pool
+tasks ramp up lazily and measured slower on suites of many short tests.
 
 ### Seeding and reproducibility
 
