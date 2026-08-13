@@ -200,8 +200,7 @@ def reproducible : TestSeq :=
 
 ## Running properties in parallel
 
-Property tests are independent and CPU-bound, so they are worth running concurrently — the same
-idea as Haskell's [`tasty`](https://github.com/UnkindPartition/tasty). The module
+Property tests are independent and CPU-bound, so they are worth running concurrently. The module
 [LSpec.Parallel](LSpec/Parallel.lean) provides drop-in parallel counterparts to the runtime
 runners:
 
@@ -219,8 +218,8 @@ def props : TestSeq :=
 def main : IO UInt32 := lspecIOParallel (.ofList [("props", [props])]) []
 ```
 
-Like `tasty`, scheduling is separated from reporting: every deferred test is launched at once,
-then the reporter walks the sequence in its original order and blocks on each result in turn.
+Scheduling is separated from reporting: every deferred test is launched at once, then the
+reporter walks the sequence in its original order and blocks on each result in turn.
 Output is therefore **byte-for-byte identical** to the sequential runner — same order, same
 samples, same counterexamples, same exit code — only faster.
 
@@ -230,18 +229,17 @@ samples, same counterexamples, same exit code — only faster.
 -- Up to `numCores` tests at once (the default).
 props.runIOParallel
 
--- `tasty`'s `-j 4`: at most four tests in flight.
+-- At most four tests in flight.
 props.runIOParallel { maxConcurrent := some 4 }
 
 -- Replay an entire run, seeds included.
 props.runIOParallel { baseSeed := 42 }
 ```
 
-`maxConcurrent` defaults to `LSpec.numCores`, the number of CPU cores available to the process —
-the same default `tasty` uses for `-j`, and the one Turnt's `ThreadPoolExecutor` inherits from
-Python. It is read from `LEAN_NUM_THREADS` if set (that variable also bounds Lean's own
-scheduler), then `NUMBER_OF_PROCESSORS` on Windows, then `sysctl -n hw.logicalcpu` or `nproc`,
-and is memoised for the process.
+`maxConcurrent` defaults to `LSpec.numCores`, the number of CPU cores available to the process.
+It is read from `LEAN_NUM_THREADS` if set (that variable also bounds Lean's own scheduler), then
+`NUMBER_OF_PROCESSORS` on Windows, then `sysctl -n hw.logicalcpu` or `nproc`, and is memoised for
+the process.
 
 The cap is built only from the task combinators in the standard library: `IO.asTask` launches a
 test, and `IO.bindTask` links the tests into `n` chains so that test `i` starts only once test

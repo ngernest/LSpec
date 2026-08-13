@@ -5,17 +5,16 @@ public import LSpec.LSpec
 # Parallel test execution for `LSpec`
 
 This module runs the *deferred* tests of a `TestSeq` — the `individualIO` and
-`individualSeededIO` nodes produced by `checkIO` and `checkPlausibleIO` — concurrently,
-in the spirit of Haskell's [`tasty`](https://github.com/UnkindPartition/tasty).
+`individualSeededIO` nodes produced by `checkIO` and `checkPlausibleIO` — concurrently.
 
 ## Design
 
-`tasty` separates *scheduling* from *reporting*: every test is launched concurrently, each
-writing into its own result cell, while the reporter walks the test tree in its original order
-and blocks on each cell in turn. Output is therefore byte-for-byte identical to a sequential
-run, no matter how the tests interleave.
+*Scheduling* is separated from *reporting*: every test is launched concurrently, each writing
+into its own result cell, while the reporter walks the test tree in its original order and blocks
+on each cell in turn. Output is therefore byte-for-byte identical to a sequential run, no matter
+how the tests interleave.
 
-The same split is used here, and it falls out of `TestSeq` being a tree of `IO` actions:
+That split falls out of `TestSeq` being a tree of `IO` actions:
 
 1. `TestSeq.spawnIO` walks the sequence once and replaces each deferred action with an action
    that merely *waits* for an already-running `Task`. It returns a `TestSeq` of the same shape.
@@ -36,8 +35,7 @@ the sequential one and a failing test can be replayed with the reported `randomS
 ## Concurrency level
 
 `ParallelConfig.maxConcurrent` caps the tests in flight. It defaults to `numCores`, the number
-of CPU cores available to the process, which is what `tasty` uses for `-j` and what Turnt's
-`ThreadPoolExecutor` picks up from Python. `some n` overrides it.
+of CPU cores available to the process. `some n` overrides it.
 
 The cap is implemented by linking the tests into `n` chains with `IO.bindTask`: test `i` waits
 for test `i - n`, so at most `n` run at once. Together with `IO.asTask` to launch a test, that is
@@ -70,8 +68,6 @@ private initialize numCoresCache : IO.Ref (Option Nat) ← IO.mkRef none
 
 /--
 The number of tests to run at once by default: the number of CPU cores available to the process.
-This is the same default that `tasty` uses for `-j`, and that Turnt's thread pool picks up from
-Python's `ThreadPoolExecutor`.
 
 Resolved in this order:
 
