@@ -202,7 +202,7 @@ def parallelTests : TestSeq :=
       if seqPass == parPass && seqOut == parOut then pure (true, 0, 0, none)
       else pure (false, 0, 0, some s!"sequential:\n{seqOut}\nparallel:\n{parOut}")
     ) .done ++
-    .individualIO "chained output matches runIO" none (do
+    .individualIO "bounded pool output matches runIO" none (do
       let (_, seqOut) ← mixedSeq.runIO
       let (_, out1) ← mixedSeq.runIOParallel { maxConcurrent := some 1 }
       let (_, out3) ← mixedSeq.runIOParallel { maxConcurrent := some 3 }
@@ -258,8 +258,8 @@ def parallelTests : TestSeq :=
       else pure (false, 0, 0,
         some s!"peak={observed} with {cores * 2} tests, expected numCores={cores}")
     ) .done ++
-    -- The chains built by `IO.bindTask` must bound the tests in flight exactly, not just
-    -- roughly: with `maxConcurrent := some n` the peak must be `min n (number of tests)`.
+    -- The worker pool must bound the tests in flight exactly, not just roughly: with
+    -- `maxConcurrent := some n` the peak must be `min n (number of tests)`.
     .individualIO "maxConcurrent bounds the tests in flight exactly" none (do
       let mut bad := #[]
       for n in [1, 2, 3, 8, 20] do
@@ -275,22 +275,40 @@ def parallelTests : TestSeq :=
       if bad.isEmpty then pure (true, 0, 0, none)
       else pure (false, 0, 0, some s!"{bad.toList}")
     ) .done ++
-    -- Each test is chained onto an earlier one with the earlier result ignored, so a test that
-    -- throws must not strand the rest of its chain.
-    .individualIO "a throwing test does not strand its chain" none (do
+    -- The shared queue distributes work dynamically: an idle worker takes the next test rather
+    -- than being tied to a fixed subset. This suite is built so that a static round-robin split
+    -- over 4 workers would put all three slow tests on one worker (indices 0, 4 and 8), costing
+    -- ~1200ms, whereas any dynamic assignment finishes in ~400-500ms.
+    .individualIO "slow tests do not monopolise one worker" none (do
+      let durations := (List.range 12).map fun i => if i % 4 == 0 then 400 else 50
+      let tSeq : TestSeq := durations.foldr (init := TestSeq.done) fun ms acc =>
+        .individualIO s!"t{ms}" none
+          (do IO.sleep (UInt32.ofNat ms); pure (true, 0, 0, none)) acc
+      let t0 ← IO.monoMsNow
+      let _ ← tSeq.runIOParallel { maxConcurrent := some 4 }
+      let elapsed := (← IO.monoMsNow) - t0
+      -- Generous margin: well under the ~1200ms a static split would cost, and safely above
+      -- the ~412ms ideal so the test does not flake on a loaded machine.
+      if elapsed < 800 then pure (true, 0, 0, none)
+      else pure (false, 0, 0,
+        some s!"took {elapsed}ms; a dynamic queue should be well under 800ms here")
+    ) .done ++
+    -- A worker catches a throwing test rather than dying on it, so the tests queued behind it
+    -- must still run and resolve their promises.
+    .individualIO "a throwing test does not kill its worker" none (do
       let ran ← IO.mkRef 0
       let mk (i : Nat) (next : TestSeq) : TestSeq :=
         .individualIO s!"t{i}" none (do
           ran.modify (· + 1)
           if i == 0 then throw (.userError "boom")
           pure (true, 0, 0, none)) next
-      -- Every test sits in one chain behind the throwing one.
+      -- One worker, so every test is queued behind the throwing one.
       let spawned ← (mk 0 (mk 1 (mk 2 (mk 3 .done)))).spawnIO { maxConcurrent := some 1 }
-      -- The renderer aborts at test 0, so wait for the chain to drain before counting.
+      -- The renderer aborts at test 0, so wait for the queue to drain before counting.
       let _ ← (spawned.runIOAux : IO _).toBaseIO
       IO.sleep 300
       if (← ran.get) == 4 then pure (true, 0, 0, none)
-      else pure (false, 0, 0, some s!"only {← ran.get} of 4 chained tests ran")
+      else pure (false, 0, 0, some s!"only {← ran.get} of 4 queued tests ran")
     ) .done ++
     .individualIO "same baseSeed replays, different baseSeed does not" none (do
       let (_, a) ← mixedSeq.runIOParallel { baseSeed := 7 }
@@ -336,7 +354,7 @@ def parallelTests : TestSeq :=
         if (toString e).containsSub "kaboom" then pure (true, 0, 0, none)
         else pure (false, 0, 0, some s!"unexpected error: {e}")
     ) .done ++
-    .individualIO "degenerate sequences and chain counts" none (do
+    .individualIO "degenerate sequences and pool sizes" none (do
       let (d, dOut) ← TestSeq.done.runIOParallel
       let (u, _) ← (test "pure" (1 = 1)).runIOParallel
       -- `maxConcurrent := some 0` must still make progress rather than deadlock.
@@ -384,8 +402,8 @@ def lspecIOParallelTests : TestSeq :=
       if rc == 0 then pure (true, 0, 0, none)
       else pure (false, 0, 0, some s!"expected rc=0 with no matches, got rc={rc}")
     ) .done ++
-    -- `maxConcurrent` must bound the whole run. Spawn state is threaded across suites, so five
-    -- suites with `some 2` run two tests at a time in total, not two per suite.
+    -- `maxConcurrent` must bound the whole run. One queue and one pool serve every suite, so
+    -- five suites with `some 2` run two tests at a time in total, not two per suite.
     .individualIO "maxConcurrent bounds concurrency across suites" none (do
       let live ← IO.mkRef 0
       let peak ← IO.mkRef 0

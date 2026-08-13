@@ -241,18 +241,18 @@ It is read from `LEAN_NUM_THREADS` if set (that variable also bounds Lean's own 
 `NUMBER_OF_PROCESSORS` on Windows, then `sysctl -n hw.logicalcpu` or `nproc`, and is memoised for
 the process.
 
-The cap is built only from the task combinators in the standard library: `IO.asTask` launches a
-test, and `IO.bindTask` links the tests into `n` chains so that test `i` starts only once test
-`i - n` has finished. There is no lock, no shared counter and no promise — the ordering
-constraint is carried by the tasks themselves, which is what the
-[reference manual](https://lean-lang.org/doc/reference/latest/IO/Tasks-and-Threads/) recommends
-over blocking on results. `lspecIOParallel` threads the chains across suites, so the cap bounds
-the whole run rather than each suite.
+The cap is a thread pool built from the standard library's concurrency types: `n` workers pull
+tests off one shared [`Std.CloseableChannel`](https://lean-lang.org/doc/reference/latest/IO/Tasks-and-Threads/),
+and each publishes its test's result to an `IO.Promise` that the renderer waits on. A worker runs
+one test at a time, so at most `n` are in flight; the queue is shared, so whichever worker is free
+takes the next test and one slow property never holds up work the others could do. Closing the
+queue after everything is enqueued is what retires the workers — a closed channel still delivers
+what is already queued, then resolves its consumers to `none`.
 
-The chains are a static round-robin split, not a work-stealing queue. A suite whose slow tests
-all have indices agreeing modulo `n` can cost about twice an ideal schedule. In exchange the
-tests run on dedicated threads, which reach full concurrency immediately — regular-priority pool
-tasks ramp up lazily and measured slower on suites of many short tests.
+`lspecIOParallel` uses a single queue and pool for every suite, so the cap bounds the whole run
+rather than each suite. Workers run on dedicated threads, which reach full concurrency
+immediately; regular-priority pool tasks ramp up lazily and measured slower on suites of many
+short tests.
 
 ### Seeding and reproducibility
 
